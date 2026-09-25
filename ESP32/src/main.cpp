@@ -1,19 +1,24 @@
 // =====================================================================
 //  СЕБАСТЬЯН — стендовый тест, СО-ПРОЦЕССОР (обычная ESP32)
-//  v2: PCM5102A -> AUX (мелодия), ARGB через 74AHCT125, 3 сенсора TTP223,
-//  кнопку мика, батарею, UART-связь с S3 (отвечает на PING).
-//  Радио 433 пока убрано — оттестим отдельно.
+//  v5.3: HOLD = код #1 три раза подряд (как 3 нажатия за секунду).
+//  v5: тест радио 433 (RCSwitch): приём 8 триггеров + коды подсветки, передача 21 код + HOLD.
+//  v4: радуга крутится постоянно, лента 4 диода.
+//  v3: Bluetooth-колонка «Sebastian» (A2DP) -> PCM5102A -> AUX,
+//  тестовая мелодия в AUX по кнопке с экрана S3, ARGB, 3 сенсора TTP223,
+//  кнопка мика, батарея, UART-связь с S3.  
 // =====================================================================
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <Adafruit_NeoPixel.h>
+#include "BluetoothA2DPSink.h"
+#include <RCSwitch.h>
 
 // ------------------------- ПИНЫ ESP32 --------------------------------
 #define PCM_BCK   26     // ВРЕМЕННО: PCM5102A напрямую (потом эти же пины уйдут в 74HC4053)
 #define PCM_LCK   25
 #define PCM_DIN   22
 #define LED_PIN   32     // ARGB -> 470 Ом -> 74AHCT125 -> лента
-#define LED_COUNT 30     // сколько диодов в ленте (больше реального — не страшно)
+#define LED_COUNT 4      // сколько диодов в ленте
 #define TOUCH1    36     // VP  — сенсор 1 (тише)
 #define TOUCH2    35     // D35 — сенсор 2 (play/stop)
 #define TOUCH3    34     // D34 — сенсор 3 (громче)
@@ -22,8 +27,20 @@
 #define MUX_SEL   21     // выбор 74HC4053 (пока чипа нет) — LOW = играет S3
 #define LINK_RX   16     // RX2 <- TX S3 (GPIO8)
 #define LINK_TX   17     // TX2 -> RX S3 (GPIO18)
+#define RF_RX     27     // приёмник 433 DATA (если RX питаешь 5V — через делитель 10к/20к!)
+#define RF_TX     13     // передатчик 433 DATA
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+BluetoothA2DPSink a2dp;
+RCSwitch rf;
+
+// ------------------------- РАДИО 433: коды -----------------------------
+// параметры твоих устройств (из esp32monitoring): протокол 1, импульс 389 мкс, 24 бита, повтор 8
+const unsigned long RF_TRIG[8] = {1382424, 1382420, 1382428, 1382418, 1382426, 1382422, 1382423, 1382431};
+const unsigned long RF_LIGHT_BASE = 9348096;     // код подсветки #n = 9348096 + n  (n = 1..21)
+unsigned long trigLast[8] = {0};
+unsigned long lightLastMs = 0, unkLastMs = 0, rxMuteUntil = 0;
+unsigned long holdNext = 0;
 
 // ------------------------- СОСТОЯНИЕ ---------------------------------
 int t[3] = {0, 0, 0}, tStable[3] = {0, 0, 0}, tCnt[3] = {0, 0, 0};
@@ -34,30 +51,22 @@ int ledMode = 0;
 unsigned long lastPing = 0, pings = 0;
 
 // =====================================================================
-//  PCM5102A (I2S0) — генератор тона
+//  Bluetooth A2DP: телефон/комп видит колонку «Sebastian», звук -> I2S0 -> PCM5102A
+//  (I2S-драйвер ставит сама библиотека; наши тоны пишем в тот же I2S0)
 // =====================================================================
-bool initPCM() {
-  i2s_config_t cfg = {};
-  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-  cfg.sample_rate = 44100;
-  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  cfg.intr_alloc_flags = 0;
-  cfg.dma_buf_count = 8;
-  cfg.dma_buf_len = 256;
-  cfg.use_apll = true;                    // у обычной ESP32 APLL есть — чище клок для ЦАП
-  cfg.tx_desc_auto_clear = true;          // когда молчим — в ЦАП идут нули
-  cfg.fixed_mclk = 0;
-  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL) != ESP_OK) return false;
+void startBT() {
   i2s_pin_config_t pins = {};
   pins.mck_io_num = I2S_PIN_NO_CHANGE;
   pins.bck_io_num = PCM_BCK;
   pins.ws_io_num = PCM_LCK;
   pins.data_out_num = PCM_DIN;
   pins.data_in_num = I2S_PIN_NO_CHANGE;
-  return i2s_set_pin(I2S_NUM_0, &pins) == ESP_OK;
+  a2dp.set_pin_config(pins);
+  a2dp.start("Sebastian");
 }
+
+bool btConnected() { return a2dp.is_connected(); }
+bool btPlaying()   { return a2dp.is_connected() && a2dp.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED; }
 
 void toneI2S(float freq, int ms, int amp = 7000) {
   const int SR = 44100;
@@ -90,6 +99,64 @@ void beepMelody() {
   toneI2S(0, 30);
 }
 
+// ---- тестовая музыка в AUX (не блокирует: играет кусочками в loop) ----
+// «Ода к радости» (Бетховен), по кругу
+struct Note { float f; int ms; };
+#define E4 329.6f
+#define F4 349.2f
+#define G4 392.0f
+#define C4 261.6f
+#define D4 293.7f
+#define G3 196.0f
+const Note SONG[] = {
+  {E4,400},{E4,400},{F4,400},{G4,400},{G4,400},{F4,400},{E4,400},{D4,400},
+  {C4,400},{C4,400},{D4,400},{E4,400},{E4,600},{D4,200},{D4,800},
+  {E4,400},{E4,400},{F4,400},{G4,400},{G4,400},{F4,400},{E4,400},{D4,400},
+  {C4,400},{C4,400},{D4,400},{E4,400},{D4,600},{C4,200},{C4,800},
+  {D4,400},{D4,400},{E4,400},{C4,400},{D4,400},{E4,200},{F4,200},{E4,400},{C4,400},
+  {D4,400},{E4,200},{F4,200},{E4,400},{D4,400},{C4,400},{D4,400},{G3,800},{0,400}};
+const int SONG_LEN = sizeof(SONG) / sizeof(SONG[0]);
+
+bool musicOn = false;
+int noteIdx = 0, noteDone = 0;
+float mph = 0;
+
+void musicToggle() {
+  if (btPlaying()) { Serial.println("[AUX] сейчас играет Bluetooth — мелодию не включаю"); return; }
+  musicOn = !musicOn;
+  noteIdx = 0; noteDone = 0; mph = 0;
+  if (!musicOn) i2s_zero_dma_buffer(I2S_NUM_0);
+  Serial.printf("[AUX] тестовая музыка: %s\n", musicOn ? "ВКЛ" : "выкл");
+}
+
+void musicTick() {
+  if (!musicOn) return;
+  if (btPlaying()) { musicOn = false; Serial.println("[AUX] пошёл Bluetooth — мелодия выкл"); return; }
+  const int SR = 44100;
+  static int16_t buf[256 * 2];
+  for (int i = 0; i < 256; i++) {
+    const Note &n = SONG[noteIdx];
+    int total = SR * n.ms / 1000;
+    int k = noteDone;
+    float env = 1.0f;
+    int att = SR / 100, rel = SR / 25;                 // 10 мс вход, 40 мс затухание
+    if (k < att) env = (float)k / att;
+    else if (k > total - rel) env = (float)(total - k) / rel;
+    if (env < 0) env = 0;
+    float v = 0;
+    if (n.f > 0) {
+      v = sinf(mph) + 0.35f * sinf(2 * mph) + 0.15f * sinf(3 * mph);   // чуть «органа» вместо голого писка
+      mph += 2.0f * PI * n.f / SR;
+      if (mph > 2 * PI) mph -= 2 * PI;
+    }
+    int16_t sm = (int16_t)(6000 * env * v);
+    buf[2 * i] = sm; buf[2 * i + 1] = sm;
+    if (++noteDone >= total) { noteDone = 0; mph = 0; noteIdx = (noteIdx + 1) % SONG_LEN; }
+  }
+  size_t bw;
+  i2s_write(I2S_NUM_0, buf, sizeof(buf), &bw, portMAX_DELAY);
+}
+
 // =====================================================================
 //  ARGB
 // =====================================================================
@@ -114,8 +181,20 @@ void ledNext() {
     case 2: ledFill(strip.Color(0, 255, 0)); break;
     case 3: ledFill(strip.Color(0, 0, 255)); break;
     case 4: ledFill(strip.Color(255, 255, 255)); break;
-    case 5: ledRainbowSweep(); break;
+    case 5: break;                                        // радуга крутится в ledTick()
   }
+}
+
+// Радуга без блокировки: каждые 20 мс сдвигаем оттенок, крутится бесконечно
+uint16_t rainbowHue = 0;
+unsigned long tRainbow = 0;
+void ledTick() {
+  if (ledMode != 5 || millis() - tRainbow < 20) return;
+  tRainbow = millis();
+  rainbowHue += 512;                                      // 65536/512 = 128 шагов ≈ 2.5 с на круг
+  for (int i = 0; i < LED_COUNT; i++)
+    strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(rainbowHue + i * 65536L / LED_COUNT)));
+  strip.show();
 }
 
 // =====================================================================
@@ -156,6 +235,79 @@ void readBattery() {
 char lb[64];
 int ll = 0;
 
+// =====================================================================
+//  РАДИО 433
+// =====================================================================
+void rfSend(unsigned long code) {
+  rf.disableReceive();                            // чтобы не поймать самих себя
+  rf.send(code, 24);
+  rf.enableReceive(RF_RX);
+  rxMuteUntil = millis() + 300;
+}
+
+void rfSendN(int n) {                             // код подсветки #n (1..21)
+  if (n < 1 || n > 21) return;
+  unsigned long code = RF_LIGHT_BASE + n;
+  strip.fill(strip.Color(255, 120, 0)); strip.show();   // оранжевая вспышка = передаю
+  rfSend(code);
+  strip.fill(0); strip.show();
+  Serial.printf("[RF] TX #%d код %lu\n", n, code);
+  Serial2.printf("X,%d,%lu\n", n, code);
+}
+
+// «HOLD» = код #1 три раза подряд (так устройство его и понимает — проверено тыком:
+// 3 нажатия за секунду срабатывают, а длинная непрерывная пачка — нет)
+int holdLeft = 0;
+void rfHoldStart() {
+  holdLeft = 3;
+  holdNext = 0;
+  Serial.println("[RF] HOLD: код #1 x3");
+}
+
+void rfHoldTick() {
+  if (!holdLeft) return;
+  if (millis() < holdNext) return;
+  rfSend(RF_LIGHT_BASE + 1);                      // сама отправка ~0.4 с (8 повторов)
+  holdLeft--;
+  holdNext = millis() + 100;                      // короткая пауза между «нажатиями»
+  if (!holdLeft) {
+    Serial2.printf("X,22,%lu\n", RF_LIGHT_BASE + 1);
+    Serial.println("[RF] HOLD готово");
+  }
+}
+
+void rfPoll() {
+  if (!rf.available()) return;
+  unsigned long v = rf.getReceivedValue();
+  int bits = rf.getReceivedBitlength();
+  int proto = rf.getReceivedProtocol();
+  int pulse = rf.getReceivedDelay();
+  rf.resetAvailable();
+  if (millis() < rxMuteUntil) return;
+  // монитор видит ВСЁ, что ловит приёмник — удобно понять, работает ли он вообще
+  Serial.printf("[RF] RX %lu  бит:%d прот:%d импульс:%dмкс\n", v, bits, proto, pulse);
+  if (bits != 24 || proto != 1) return;           // фильтр: 433-приёмник ловит много мусора
+  for (int i = 0; i < 8; i++) {
+    if (v == RF_TRIG[i]) {
+      if (millis() - trigLast[i] < 1000) return;  // антидребезг: пульт шлёт код пачкой
+      trigLast[i] = millis();
+      Serial.printf("[RF] >>> ТРИГГЕР %d <<<\n", i + 1);
+      Serial2.printf("R,%d,%lu\n", i + 1, v);
+      strip.fill(strip.Color(0, 255, 0)); strip.show(); delay(80); strip.fill(0); strip.show();
+      return;
+    }
+  }
+  if (v > RF_LIGHT_BASE && v <= RF_LIGHT_BASE + 21) {
+    if (millis() - lightLastMs < 300) return;
+    lightLastMs = millis();
+    Serial2.printf("L,%d,%lu\n", (int)(v - RF_LIGHT_BASE), v);
+    return;
+  }
+  if (millis() - unkLastMs < 500) return;
+  unkLastMs = millis();
+  Serial2.printf("U,%lu\n", v);
+}
+
 void handleCmd(char *s) {
   if (!strncmp(s, "PING", 4)) {                  // PING n -> отвечаем P,n
     lastPing = millis(); pings++;
@@ -164,7 +316,10 @@ void handleCmd(char *s) {
   }
   Serial.printf("[LINK] команда от S3: %s\n", s);
   if (!strcmp(s, "BEEP")) beepMelody();
+  else if (!strcmp(s, "MUSIC")) musicToggle();
   else if (!strcmp(s, "LED")) ledNext();
+  else if (!strncmp(s, "RF ", 3)) rfSendN(atoi(s + 3));
+  else if (!strcmp(s, "RFHOLD")) rfHoldStart();
 }
 
 void pollLink() {
@@ -179,7 +334,7 @@ void pollLink() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n\n===== SEBASTIAN BENCH v2: CO-PROCESSOR (ESP32) =====");
+  Serial.println("\n\n===== SEBASTIAN BENCH v5: CO-PROCESSOR (ESP32) =====");
 
   Serial2.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
 
@@ -194,10 +349,18 @@ void setup() {
   ledRainbowSweep();
   ledFill(0);
 
-  bool pcm = initPCM();
-  Serial.printf("[AUX] I2S PCM5102A (BCK %d, LCK %d, DIN %d): %s\n", PCM_BCK, PCM_LCK, PCM_DIN, pcm ? "OK" : "FAIL");
-  delay(500);
-  if (pcm) beepMelody();                                  // сразу при старте — AUX должен пискнуть
+  rf.enableReceive(RF_RX);                        // на ESP32 номер прерывания = номер пина
+  rf.enableTransmit(RF_TX);
+  rf.setProtocol(1);
+  rf.setPulseLength(389);                          // ПОСЛЕ setProtocol (он сбрасывает длину)
+  rf.setRepeatTransmit(8);
+  Serial.printf("[RF] радио 433: RX=%d TX=%d, прот 1, 389 мкс, 24 бита\n", RF_RX, RF_TX);
+
+  startBT();
+  Serial.printf("[BT] Bluetooth-колонка \"Sebastian\" запущена, I2S -> PCM5102A (BCK %d, LCK %d, DIN %d)\n",
+                PCM_BCK, PCM_LCK, PCM_DIN);
+  delay(300);
+  beepMelody();                                           // при старте AUX должен пискнуть
 
   readBattery();
   Serial.printf("[BAT] %.2f V\n", batmV / 1000.0f);
@@ -210,16 +373,31 @@ unsigned long tStat = 0, tBat = 0, tLog = 0;
 void loop() {
   pollLink();
   pollInputs();
+  musicTick();
+  ledTick();
+  rfPoll();
+  rfHoldTick();
+
+  static int lastBt = -1;
+  int btNow = btPlaying() ? 2 : (btConnected() ? 1 : 0);
+  if (btNow != lastBt) {
+    lastBt = btNow;
+    const char *names[] = {"ждёт подключения", "ПОДКЛЮЧЁН", "ИГРАЕТ"};
+    Serial.printf("[BT] %s%s%s\n", names[btNow], btNow ? " — " : "", btNow ? a2dp.get_connected_source_name() : "");
+    if (btNow == 1) ledFill(strip.Color(0, 0, 255));      // подключился — лента синяя
+  }
 
   if (millis() - tBat > 1000) { tBat = millis(); readBattery(); }
   if (millis() - tStat > 200) {
     tStat = millis();
-    Serial2.printf("S,%d,%d,%d,%d,%d,%lu\n", t[0], t[1], t[2], micBtn, batmV, millis() / 1000);
+    int bt = btPlaying() ? 2 : (btConnected() ? 1 : 0);
+    Serial2.printf("S,%d,%d,%d,%d,%d,%lu,%d,%d\n", t[0], t[1], t[2], micBtn, batmV, millis() / 1000, bt, musicOn ? 1 : 0);
   }
   if (millis() - tLog > 2000) {
     tLog = millis();
-    Serial.printf("[STAT] T:%d%d%d micbtn:%d bat:%.2fV | от S3: %s (PING %lu)\n",
+    Serial.printf("[STAT] T:%d%d%d micbtn:%d bat:%.2fV BT:%s music:%d | от S3: %s (PING %lu)\n",
                   t[0], t[1], t[2], micBtn, batmV / 1000.0f,
+                  btPlaying() ? "play" : btConnected() ? "conn" : "wait", musicOn,
                   (lastPing && millis() - lastPing < 2500) ? "OK" : "НЕТ (провод S3 8 -> ESP 16?)", pings);
   }
 }
