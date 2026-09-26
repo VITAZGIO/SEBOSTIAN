@@ -1,5 +1,7 @@
 // =====================================================================
 //  СЕБАСТЬЯН — стендовый тест, СО-ПРОЦЕССОР (обычная ESP32)
+//  v6.1: при старте на ленте крутится радуга (проверка прошивки по Wi-Fi).
+//  v6: прошивка по Wi-Fi (OTA): команда "OTA" с экрана головы -> BT выкл, Wi-Fi, 5 мин ждёт.
 //  v5.3: HOLD = код #1 три раза подряд (как 3 нажатия за секунду).
 //  v5: тест радио 433 (RCSwitch): приём 8 триггеров + коды подсветки, передача 21 код + HOLD.
 //  v4: радуга крутится постоянно, лента 4 диода.
@@ -12,6 +14,10 @@
 #include <Adafruit_NeoPixel.h>
 #include "BluetoothA2DPSink.h"
 #include <RCSwitch.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include "secrets.h"      // WIFI_SSID, WIFI_PASS, OTA_PASS — тот же файл, что у головы
 
 // ------------------------- ПИНЫ ESP32 --------------------------------
 #define PCM_BCK   26     // ВРЕМЕННО: PCM5102A напрямую (потом эти же пины уйдут в 74HC4053)
@@ -308,18 +314,81 @@ void rfPoll() {
   Serial2.printf("U,%lu\n", v);
 }
 
+// =====================================================================
+//  OTA: прошивка по Wi-Fi. Bluetooth и Wi-Fi на одном радио мешают друг другу,
+//  поэтому на время прошивки BT выключаем, а потом плата перезагружается.
+// =====================================================================
+bool otaMode = false;
+int otaState = 0;                 // 1 подключаюсь, 2 жду, 3 прошиваюсь, 4 готово, 9 ошибка
+int otaPct = 0;
+unsigned long otaStartMs = 0, otaStatMs = 0, otaErrMs = 0;
+String otaIp = "-";
+const unsigned long OTA_TIMEOUT = 5UL * 60UL * 1000UL;   // 5 минут ждём, потом назад в обычный режим
+
+void otaReport() { Serial2.printf("W,%d,%d,%s\n", otaState, otaPct, otaIp.c_str()); }
+
+void otaStart() {
+  if (otaMode) return;
+  otaMode = true;
+  otaState = 1; otaPct = 0; otaStartMs = millis();
+  Serial.println("[OTA] режим прошивки: выключаю Bluetooth, подключаюсь к Wi-Fi...");
+  otaReport();
+  musicOn = false;
+  holdLeft = 0;
+  rf.disableReceive();
+  strip.fill(strip.Color(120, 0, 160)); strip.show();   // фиолетовая = режим прошивки
+  a2dp.end(true);                                       // BT выкл + освободить память под Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("sebastian-coproc");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+void otaTick() {
+  if (otaState == 1) {
+    if (WiFi.status() == WL_CONNECTED) {
+      otaIp = WiFi.localIP().toString();
+      ArduinoOTA.setHostname("sebastian-coproc");
+      ArduinoOTA.setPassword(OTA_PASS);
+      ArduinoOTA.onStart([]() { otaState = 3; otaPct = 0; otaReport(); Serial.println("[OTA] приём прошивки..."); });
+      ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+        int p = total ? done * 100 / total : 0;
+        if (p != otaPct) { otaPct = p; if (p % 5 == 0) otaReport(); }
+      });
+      ArduinoOTA.onEnd([]() { otaState = 4; otaReport(); Serial2.flush(); Serial.println("[OTA] готово, перезагрузка"); });
+      ArduinoOTA.onError([](ota_error_t e) { otaState = 9; otaErrMs = millis(); otaReport(); Serial.printf("[OTA] ошибка %u\n", e); });
+      ArduinoOTA.begin();
+      otaState = 2;
+      Serial.printf("[OTA] жду прошивку: IP %s (sebastian-coproc.local), 5 минут\n", otaIp.c_str());
+    } else if (millis() - otaStartMs > 20000) {
+      otaState = 9; otaErrMs = millis();
+      Serial.println("[OTA] Wi-Fi не подключился (SSID/пароль в secrets.h?)");
+    }
+  }
+  if (otaState == 2 || otaState == 3) ArduinoOTA.handle();
+  if (millis() - otaStatMs > 500) { otaStatMs = millis(); otaReport(); }
+  // выход: ошибка -> через 3 с, никто не прошил за 5 мин -> перезагрузка в обычный режим с BT
+  if ((otaState == 9 && millis() - otaErrMs > 3000) || (otaState == 2 && millis() - otaStartMs > OTA_TIMEOUT)) {
+    Serial.println("[OTA] выхожу из режима прошивки — перезагрузка");
+    otaState = 0; otaReport(); Serial2.flush();
+    delay(200);
+    ESP.restart();
+  }
+}
+
 void handleCmd(char *s) {
   if (!strncmp(s, "PING", 4)) {                  // PING n -> отвечаем P,n
     lastPing = millis(); pings++;
     Serial2.printf("P,%s\n", s[4] ? s + 5 : "0");
     return;
   }
+  if (otaMode) return;                            // в режиме прошивки остальные команды не выполняем
   Serial.printf("[LINK] команда от S3: %s\n", s);
   if (!strcmp(s, "BEEP")) beepMelody();
   else if (!strcmp(s, "MUSIC")) musicToggle();
   else if (!strcmp(s, "LED")) ledNext();
   else if (!strncmp(s, "RF ", 3)) rfSendN(atoi(s + 3));
   else if (!strcmp(s, "RFHOLD")) rfHoldStart();
+  else if (!strcmp(s, "OTA")) otaStart();
 }
 
 void pollLink() {
@@ -334,7 +403,7 @@ void pollLink() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n\n===== SEBASTIAN BENCH v5: CO-PROCESSOR (ESP32) =====");
+  Serial.println("\n\n===== SEBASTIAN BENCH v6.1: CO-PROCESSOR (ESP32) =====");
 
   Serial2.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
 
@@ -346,8 +415,7 @@ void setup() {
 
   strip.begin();
   strip.setBrightness(40);                                // ~15% — не жжём глаза и БП
-  ledRainbowSweep();
-  ledFill(0);
+  ledMode = 5;                                            // при старте — радуга (крутится в ledTick)
 
   rf.enableReceive(RF_RX);                        // на ESP32 номер прерывания = номер пина
   rf.enableTransmit(RF_TX);
@@ -371,6 +439,7 @@ void setup() {
 unsigned long tStat = 0, tBat = 0, tLog = 0;
 
 void loop() {
+  if (otaMode) { pollLink(); otaTick(); return; }   // в режиме прошивки — только связь и OTA
   pollLink();
   pollInputs();
   musicTick();
