@@ -1,5 +1,18 @@
 // =====================================================================
-//  СЕБАСТЬЯН — стендовый тест, ГОЛОВА (ESP32-S3)  v18
+//  СЕБАСТЬЯН — стендовый тест, ГОЛОВА (ESP32-S3)  v21
+//  v21: страница OUTPUT — куда идёт звук: DINAMIKI / AUX / OBA (запоминается во флеше).
+//       AUX без штекера -> играют динамики. Переключатель источника 74HC4053 на со-процессоре:
+//       голова шлёт "S3B 1/0" (S3 сейчас звучит / молчит), со-процессор сам выбирает S3 или Bluetooth.
+//  v20: 1) Включил тумблером, а аккум «сел» (со-процессор шлёт "G,mV") -> экран с кнопкой
+//          VKLYUCHIT' на 5 с (или сенсор 2). Нажал -> "FORCE", работаем (для зарядки).
+//          Не нажал -> спим дальше.
+//       2) Лог аккума на SD: раз в секунду время + напряжение + %, только при 100-70% и 30-0%.
+//          Файлы по часам: /batlog/ГГГГММДД_ЧЧ.csv. С ПК: http://<IP головы>/bat.tar
+//  v19: защита аккума (вместе с со-процессором v7). Пришло "B,2" (аккум < 3.0 В) ->
+//       ответ "SLEEP", звук/Wi-Fi выкл, экран «BATAREYA SELA», глубокий сон.
+//       Будит: со-процессор (зарядился >= 3.55 В) или касание экрана (покажет, что сел).
+//       Запасной путь: связь пропала > 30 с, а аккум был < 3.15 В -> тоже спать.
+//       < 3.3 В — красная надпись LOW BAT раз в минуту, строка BAT цветная.
 //  v18: страница TRAIN — запись сэмплов для обучения своего слова «Себастьян» (на SD):
 //       POS x10 (слово), NEG x10 (другие слова), FON 30 s (фон), PLAY/DEL последнего.
 //       Всё скачивается с ПК одним файлом: http://<IP головы>/kws.tar (веб-сервер на :80).
@@ -34,6 +47,11 @@
 #include <driver/i2s.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#include <esp_sleep.h>
+#include <Preferences.h>
+#include <vector>
+#include <driver/rtc_io.h>
+#include <driver/gpio.h>
 #include "AudioOutput.h"
 #include "AudioFileSourceSD.h"
 #include "AudioFileSourceBuffer.h"
@@ -75,6 +93,12 @@ static uint16_t calData[5] = {460, 3320, 340, 3430, 1};   // калибровк�
 // Другие: Самара "<+04>-4", Екатеринбург "<+05>-5", Новосибирск "<+07>-7", Владивосток "<+10>-10".
 #define TZ_INFO "MSK-3"
 
+// Батарея (напряжение меряет со-процессор, сюда приходит среднее за 10 с)
+#define BAT_NONE 2500                    // ниже = аккума нет (стенд от USB)
+#define BAT_LOW  3300                    // предупреждение LOW BAT
+RTC_DATA_ATTR bool headBatSleep = false; // true = уснули из-за аккума (переживает глубокий сон)
+extern uint32_t blLines;                 // строк лога аккума с запуска (определено ниже)
+
 // Сервер Себастьяна (Ubuntu VM): голосовой контур sebastian-voice
 #define SEB_HOST   "192.168.1.201"
 #define SEB_PORT   9010
@@ -92,6 +116,15 @@ static uint16_t calData[5] = {460, 3320, 340, 3430, 1};   // калибровк�
 // ------------------------- СОСТОЯНИЕ ---------------------------------
 bool sdOk = false, fileOk = false, micOk = false;
 bool spkMuted = false, auxMuted = false;
+// куда выводим звук (страница OUTPUT): динамики / AUX / оба
+enum { OUT_SPK, OUT_AUX, OUT_BOTH };
+int outMode = OUT_BOTH;
+const char *OUT_NAMES[3] = {"DINAMIKI", "AUX", "OBA"};
+Preferences prefs;                       // NVS — хранилище во флеше (переживает выключение)
+volatile bool testBusy = false;          // играет тест/запись (L/R, MIC, TRAIN) — для переключателя источника
+int cpMux = -1;                          // что выбрал 74HC4053 на со-процессоре: 0 = S3, 1 = Bluetooth
+bool spkOn(); bool auxOn();            // объявления — определены ниже (у applyMutes)
+void s3BusyReport(bool force = false);
 bool auxPlug = false;                    // штекер AUX вставлен?
 uint64_t sdSizeMB = 0;
 float micLevel = 0;
@@ -345,6 +378,7 @@ const char *rstName(esp_reset_reason_t r) {
     case ESP_RST_WDT:      return "WATCHDOG";
     case ESP_RST_BROWNOUT: return "BROWNOUT";
     case ESP_RST_EXT:      return "RESET BTN";
+    case ESP_RST_DEEPSLEEP: return "SLEEP WAKE";
     default:               return "OTHER";
   }
 }
@@ -376,13 +410,13 @@ bool timeValid(struct tm &t) { return timeStarted && getLocalTime(&t, 0) && t.tm
 //  ЭКРАН: страницы
 //  шапка (0..20) | содержимое (22..282) | навигация < > (286..318)
 // =====================================================================
-enum { PG_HOME, PG_VOICE, PG_TRAIN, PG_AUDIO, PG_SENS, PG_RADIO, PG_SYS, PG_COUNT };
-const char *PG_NAMES[PG_COUNT] = {"HOME", "VOICE", "TRAIN", "AUDIO", "SENSORS", "RADIO", "SYSTEM"};
+enum { PG_HOME, PG_VOICE, PG_TRAIN, PG_AUDIO, PG_OUT, PG_SENS, PG_RADIO, PG_SYS, PG_COUNT };
+const char *PG_NAMES[PG_COUNT] = {"HOME", "VOICE", "TRAIN", "AUDIO", "OUTPUT", "SENSORS", "RADIO", "SYSTEM"};
 int page = PG_HOME;
 
 enum {
   B_PREV = 1, B_NEXT, B_PLAY, B_VOLM, B_VOLP, B_SPK, B_AUX, B_AUXMUS, B_LR, B_MIC,
-  B_LED, B_BEEP, B_CPOTA, B_REBOOT, B_WIFI, B_ASK, B_SRV, B_WAKE, B_KPOS, B_KNEG, B_KBG, B_KPLAY, B_KDEL, B_KTIP, B_RF = 100    // B_RF+0..20 коды, B_RF+21 HOLD
+  B_LED, B_BEEP, B_CPOTA, B_REBOOT, B_WIFI, B_ASK, B_SRV, B_WAKE, B_KPOS, B_KNEG, B_KBG, B_KPLAY, B_KDEL, B_KTIP, B_OSPK, B_OAUX, B_OBOTH, B_RF = 100    // B_RF+0..20 коды, B_RF+21 HOLD
 };
 struct Btn { int x, y, w, h, id; const char *label; };
 Btn pb[30];                    // кнопки текущей страницы
@@ -407,6 +441,9 @@ uint16_t btnColor(int id) {
     case B_ASK:    return TFT_DARKGREEN;
     case B_WAKE:   return wakeOn ? TFT_DARKGREEN : 0x4208;
     case B_RF + 21: return 0x7800;
+    case B_OSPK:   return outMode == OUT_SPK ? TFT_DARKGREEN : 0x3186;
+    case B_OAUX:   return outMode == OUT_AUX ? TFT_DARKGREEN : 0x3186;
+    case B_OBOTH:  return outMode == OUT_BOTH ? TFT_DARKGREEN : 0x3186;
     default:       return 0x3186;
   }
 }
@@ -480,7 +517,7 @@ void drawNav() {
   tft.fillRect(64, 286, 112, 32, TFT_BLACK);
   // точки страниц
   for (int i = 0; i < PG_COUNT; i++) {
-    int x = 120 - (PG_COUNT - 1) * 8 + i * 16;
+    int x = 120 - (PG_COUNT - 1) * 7 + i * 14;
     if (i == page) tft.fillCircle(x, 302, 5, TFT_WHITE);
     else tft.drawCircle(x, 302, 5, TFT_DARKGREY);
   }
@@ -517,6 +554,11 @@ void buildPage() {
       int ids[8] = {B_PLAY, B_MIC, B_VOLM, B_VOLP, B_SPK, B_AUX, B_AUXMUS, B_LR};
       const char *lb[8] = {"PLAY / STOP", "MIC TEST 2s", "VOL -", "VOL +", "SPK MUTE", "AUX MUTE", "AUX MUSIC", "L / R TEST"};
       grid2(112, 40, ids, lb, 8);
+    } break;
+    case PG_OUT: {
+      addBtn(10, 120, 220, 46, B_OSPK, "DINAMIKI");
+      addBtn(10, 172, 220, 46, B_OAUX, "AUX");
+      addBtn(10, 224, 220, 46, B_OBOTH, "OBA");
     } break;
     case PG_SENS: {
       int ids[2] = {B_LED, B_BEEP};
@@ -556,6 +598,10 @@ String batText() {
   char b[40]; snprintf(b, sizeof(b), "BAT: %.2fV  %d%%", cpBat / 1000.0f, batPercent(cpBat));
   return b;
 }
+uint16_t batCol() {
+  if (!rxOk() || cpBat < BAT_NONE) return TFT_WHITE;
+  return cpBat < BAT_LOW ? TFT_RED : cpBat < 3600 ? TFT_YELLOW : TFT_GREEN;
+}
 const char *btText() { return !rxOk() ? "---" : cpBt == 2 ? "PLAY" : cpBt == 1 ? "CONNECTED" : "zhdet"; }
 
 void pageHome() {
@@ -583,7 +629,7 @@ void pageHome() {
   line(4, dt, TFT_CYAN);
   line(6, String("WiFi: ") + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() + "  " + WiFi.RSSI() + "dBm" : String("net (") + WIFI_SSID + ")"),
        WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED);
-  line(7, batText(), TFT_WHITE);
+  line(7, batText(), batCol());
   line(8, String("BT: ") + btText() + "   LINK: " + (rxOk() && txOk() ? "OK" : "NET"), rxOk() && txOk() ? TFT_WHITE : TFT_RED);
   char s[48]; snprintf(s, sizeof(s), "AUDIO: %s  vol %.2f", isPlaying() ? "PLAY" : "stop", volume);
   line(9, s, isPlaying() ? TFT_GREEN : TFT_WHITE);
@@ -596,8 +642,8 @@ void pageAudio() {
   line(0, s, isPlaying() ? TFT_GREEN : TFT_WHITE);
   if (!sdOk) line(1, "SD: FAIL (FAT32? CS=5)", TFT_RED);
   else { snprintf(s, sizeof(s), "SD: %lluMB  test.mp3:%s", (unsigned long long)sdSizeMB, fileOk ? "YES" : "NO"); line(1, s, fileOk ? TFT_GREEN : TFT_YELLOW); }
-  snprintf(s, sizeof(s), "SPK:%s  AUX:%s  JACK:%s%s", spkMuted ? "OFF" : "ON", (auxPlug && !auxMuted) ? "ON" : "OFF",
-           auxPlug ? "IN" : "--", cpAuxMusic ? " music" : "");
+  snprintf(s, sizeof(s), "OUT:%s SPK:%s AUX:%s JACK:%s", OUT_NAMES[outMode], spkOn() ? "ON" : "OFF", auxOn() ? "ON" : "OFF",
+           auxPlug ? "IN" : "--");
   line(2, s);
   if (!micOk) line(3, "MIC: I2S FAIL", TFT_RED);
   else { snprintf(s, sizeof(s), "MIC %5d", (int)micLevel); line(3, s, TFT_CYAN); micBar(24 + 3 * 17); }
@@ -613,7 +659,7 @@ void pageSens() {
   if (txOk()) snprintf(s, sizeof(s), "S3->ESP: OK  ping %lu/%lu", lastAck, pingSent);
   else snprintf(s, sizeof(s), "S3->ESP: NET (S3 8 -> ESP 16)");
   line(1, s, txOk() ? TFT_GREEN : TFT_RED);
-  line(2, batText());
+  line(2, batText(), batCol());
   line(3, String("BT: ") + btText() + "   coproc up " + (rxOk() ? uptimeStr(cpUp) : String("---")));
   line(4, String("AUX JACK: ") + (auxPlug ? "vstavlen" : "net"), auxPlug ? TFT_GREEN : TFT_WHITE);
   line(5, rfRxText, rfRxMs && millis() - rfRxMs < 3000 ? TFT_YELLOW : TFT_WHITE);
@@ -652,6 +698,19 @@ String otaText(const char *who, int st, int pct, const String &ip) {
   }
 }
 
+void pageOut() {
+  char s[64];
+  snprintf(s, sizeof(s), "VYVOD: %s", OUT_NAMES[outMode]);
+  line(0, s, TFT_CYAN);
+  snprintf(s, sizeof(s), "dinamiki: %s   AUX: %s", spkOn() ? "IGRAYUT" : "molchat", auxOn() ? "IGRAET" : "molchit");
+  line(1, s, TFT_WHITE);
+  if (outMode != OUT_SPK && !auxPlug) line(2, "shteker AUX ne vstavlen -> dinamiki", TFT_YELLOW);
+  else line(2, String("shteker AUX: ") + (auxPlug ? "vstavlen" : "net"), auxPlug ? TFT_GREEN : TFT_DARKGREY);
+  const char *src = !rxOk() ? "---" : cpMux == 1 ? "BLUETOOTH" : cpMux == 0 ? "S3 (golova)" : "? (staryi coproc)";
+  line(3, String("istochnik: ") + src, cpMux == 1 ? TFT_CYAN : TFT_WHITE);
+  line(4, (spkMuted || auxMuted) ? "vnimanie: vklyuchen MUTE na AUDIO" : "", TFT_RED);
+}
+
 void pageSys() {
   bool wc = WiFi.status() == WL_CONNECTED;
   line(0, String("WiFi: ") + WIFI_SSID + (wc ? "  " + String(WiFi.RSSI()) + "dBm" : "  NET"), wc ? TFT_GREEN : TFT_RED);
@@ -665,7 +724,7 @@ void pageSys() {
   line(5, String("uptime: ") + uptimeStr(millis() / 1000));
   snprintf(s, sizeof(s), "start: %s  boot#%lu", rstName(rstReason), (unsigned long)bootCount);
   line(6, s, badReset() ? TFT_RED : TFT_WHITE);
-  line(7, "v18  " __DATE__, TFT_DARKGREY);
+  line(7, String("v21  " __DATE__ "  batlog ") + blLines, TFT_DARKGREY);
 }
 
 void updatePage() {
@@ -676,6 +735,7 @@ void updatePage() {
     case PG_AUDIO: pageAudio(); break;
     case PG_SENS:  pageSens(); break;
     case PG_RADIO: pageRadio(); break;
+    case PG_OUT:   pageOut(); break;
     case PG_SYS:   pageSys(); break;
   }
 }
@@ -1371,7 +1431,7 @@ void voiceAsk(bool ptt) {
   uint8_t *wav = (uint8_t *)heap_caps_malloc(44 + NMAX * 2, MALLOC_CAP_SPIRAM);
   if (!wav) { vSet("OSHIBKA: net PSRAM", TFT_RED); return; }
 
-  voiceBusy = true;
+  voiceBusy = true; s3BusyReport();   // 74HC4053 -> S3
   micHold();                                       // микрофон — наш, слушатель ждёт
   loopMp3 = false; stopMp3();
   lsMode = LM_WAKE;
@@ -1420,7 +1480,7 @@ void wakeProcess() {
   if (!wav) { lsState = 0; return; }
   memcpy(wav + 44, lsSeg, len * 2);
   lsState = 0;                                     // слушатель на паузе (voiceBusy), буфер свободен
-  voiceBusy = true;
+  voiceBusy = true; s3BusyReport();   // 74HC4053 -> S3
   size_t wl = buildWav(wav, len);
 
   if (mode == LM_CMD) {                            // после «дзынь»: это сама команда
@@ -1641,7 +1701,7 @@ void kwsSeries(int kind) {
   const int N = 16000 * KWS_CLIP_MS / 1000;
   int16_t *buf = (int16_t *)heap_caps_malloc(N * 2, MALLOC_CAP_SPIRAM);
   if (!buf) { kwsSet("net PSRAM", TFT_RED); return; }
-  voiceBusy = true;
+  voiceBusy = true; s3BusyReport();   // 74HC4053 -> S3
   micHold();                                       // микрофон забираем у слушателя
   loopMp3 = false; stopMp3();
   kwsScan();
@@ -1683,7 +1743,7 @@ void kwsBackground() {
   const int N = 16000 * KWS_BG_S;
   int16_t *buf = (int16_t *)heap_caps_malloc(N * 2, MALLOC_CAP_SPIRAM);
   if (!buf) { kwsSet("net PSRAM", TFT_RED); return; }
-  voiceBusy = true;
+  voiceBusy = true; s3BusyReport();   // 74HC4053 -> S3
   micHold();
   loopMp3 = false; stopMp3();
   kwsScan();
@@ -1749,6 +1809,54 @@ void pageTrain() {
   line(8, kwsTip >= 0 ? String(KWS_TIPS[kwsTip]) : String("SOVET - podskazki kak pisat'"), TFT_DARKGREY);
 }
 
+// ---------- лог аккума на SD: /batlog/ГГГГММДД_ЧЧ.csv ----------
+// раз в секунду: время, мВ (среднее за 10 с от со-процессора), %, что нагружает (mp3/BT/голос/громкость).
+// Пишем только 100–70% и 30–0% — там видна форма кривой разряда. На SD сбрасываем раз в 10 с.
+String blBuf, blFile;
+unsigned long tBl = 0, tBlFlush = 0;
+uint32_t blLines = 0;
+
+void batLogFlush() {
+  if (!sdOk || !blBuf.length() || !blFile.length()) return;
+  bool isNew = !SD.exists(blFile);
+  File f = SD.open(blFile, FILE_APPEND);
+  if (f) {
+    if (isNew) f.print("time,mV,pct,mp3,bt,voice,vol\n");
+    f.print(blBuf);
+    f.close();
+  }
+  blBuf = "";
+}
+
+void batLogTick() {
+  if (!sdOk || millis() - tBl < 1000) return;
+  tBl = millis();
+  if (!rxOk() || cpBat < BAT_NONE) return;         // нет связи / нет аккума (стенд от USB)
+  int p = batPercent(cpBat);
+  if (p > 30 && p < 70) { batLogFlush(); return; } // середину не пишем
+  struct tm t;
+  char fn[40], ts[16];
+  if (timeValid(t)) {
+    strftime(fn, sizeof(fn), "/batlog/%Y%m%d_%H.csv", &t);
+    strftime(ts, sizeof(ts), "%H:%M:%S", &t);
+  } else {                                          // нет времени (нет Wi-Fi) — по аптайму
+    unsigned long sec = millis() / 1000;
+    snprintf(fn, sizeof(fn), "/batlog/notime_b%lu_%02lu.csv", (unsigned long)bootCount, sec / 3600);
+    snprintf(ts, sizeof(ts), "+%lu", sec);
+  }
+  if (blFile != fn) {                               // новый час — новый файл
+    batLogFlush();
+    blFile = fn;
+    if (!SD.exists("/batlog")) SD.mkdir("/batlog");
+  }
+  char l[64];
+  snprintf(l, sizeof(l), "%s,%d,%d,%d,%d,%d,%.2f\n", ts, cpBat, p, isPlaying() ? 1 : 0, cpBt,
+           (voiceBusy || plBusy) ? 1 : 0, volume);
+  blBuf += l;
+  blLines++;
+  if (millis() - tBlFlush > 10000) { tBlFlush = millis(); batLogFlush(); }
+}
+
 // ---------- веб: скачать все сэмплы одним tar ----------
 WebServer web(80);
 bool webStarted = false;
@@ -1772,11 +1880,14 @@ static void tarHeader(uint8_t *h, const String &name, uint32_t size) {
 }
 
 static const char *KWS_DIRS[3] = {"/kws/pos", "/kws/neg", "/kws/bg"};
+static const char *BAT_DIRS[1] = {"/batlog"};
 
-void webKwsTar() {
+// отдать папки с SD одним tar-архивом (tar — «склейка» файлов в один без сжатия)
+void sendTar(const char *const *dirs, int nd, const char *fname) {
   if (!sdOk) { web.send(503, "text/plain", "no SD"); return; }
   uint32_t total = 1024;
-  for (auto dir : KWS_DIRS) {
+  for (int di = 0; di < nd; di++) {
+    const char *dir = dirs[di];
     File d = SD.open(dir);
     if (!d) continue;
     for (File f = d.openNextFile(); f; f = d.openNextFile()) {
@@ -1786,11 +1897,12 @@ void webKwsTar() {
     d.close();
   }
   web.setContentLength(total);
-  web.sendHeader("Content-Disposition", "attachment; filename=kws.tar");
+  web.sendHeader("Content-Disposition", String("attachment; filename=") + fname);
   web.send(200, "application/x-tar", "");
   static uint8_t buf[4096], hdr[512];
   static const uint8_t zeros[512] = {0};
-  for (auto dir : KWS_DIRS) {
+  for (int di = 0; di < nd; di++) {
+    const char *dir = dirs[di];
     File d = SD.open(dir);
     if (!d) continue;
     for (File f = d.openNextFile(); f; f = d.openNextFile()) {
@@ -1807,20 +1919,40 @@ void webKwsTar() {
   }
   web.sendContent((const char *)zeros, 512);
   web.sendContent((const char *)zeros, 512);
-  Serial.printf("[WEB] kws.tar отдан, %u байт\n", (unsigned)total);
+  Serial.printf("[WEB] %s отдан, %u байт\n", fname, (unsigned)total);
+}
+void webKwsTar() { sendTar(KWS_DIRS, 3, "kws.tar"); }
+void webBatTar() { batLogFlush(); sendTar(BAT_DIRS, 1, "bat.tar"); }
+void webBatClear() {                               // http://<IP>/bat_clear?yes=1 — стереть лог аккума
+  if (web.arg("yes") != "1") { web.send(200, "text/plain", "dobav ?yes=1 chtoby steret' /batlog"); return; }
+  batLogFlush();
+  int n = 0;
+  File d = SD.open("/batlog");
+  if (d) {
+    std::vector<String> names;
+    for (File f = d.openNextFile(); f; f = d.openNextFile()) { if (!f.isDirectory()) names.push_back(String("/batlog/") + f.name()); f.close(); }
+    d.close();
+    for (auto &p : names) if (SD.remove(p)) n++;
+  }
+  blLines = 0;
+  web.send(200, "text/plain", String("udaleno faylov: ") + n);
 }
 
 void webRoot() {
   kwsScan();
   String h = "<html><head><meta charset='utf-8'><title>Sebastian head</title></head><body style='font-family:sans-serif'>"
              "<h2>Себастьян — голова</h2><p>Сэмплы слова: POS " + String(kwsPos) + ", NEG " + String(kwsNeg) +
-             ", FON " + String(kwsBg) + "</p><p><a href='/kws.tar'>Скачать все сэмплы (kws.tar)</a></p></body></html>";
+             ", FON " + String(kwsBg) + "</p><p><a href='/kws.tar'>Скачать все сэмплы (kws.tar)</a></p>"
+             "<p>Лог аккума: " + String(blLines) + " строк с запуска. <a href='/bat.tar'>Скачать (bat.tar)</a> · "
+             "<a href='/bat_clear?yes=1'>стереть</a></p></body></html>";
   web.send(200, "text/html; charset=utf-8", h);
 }
 
 void webSetup() {
   web.on("/", webRoot);
   web.on("/kws.tar", webKwsTar);
+  web.on("/bat.tar", webBatTar);
+  web.on("/bat_clear", webBatClear);
   web.begin();
   webStarted = true;
   Serial.println("[WEB] http-сервер на порту 80");
@@ -1829,12 +1961,38 @@ void webSetup() {
 // =====================================================================
 //  ВЫХОДЫ, ГРОМКОСТЬ, ДЕТЕКТ AUX
 // =====================================================================
+// Динамики: режим DINAMIKI или OBA; в режиме AUX — только если штекера нет (запасной вариант, чтобы не было тишины)
+bool spkOn() { return !spkMuted && (outMode != OUT_AUX || !auxPlug); }
+// AUX: штекер вставлен и режим AUX или OBA
+bool auxOn() { return !auxMuted && auxPlug && outMode != OUT_SPK; }
+
 void applyMutes() {
-  digitalWrite(PIN_SPK_MUTE, spkMuted ? HIGH : LOW);
-  bool auxOn = auxPlug && !auxMuted;               // AUX играет только если штекер вставлен и не заглушён кнопкой
-  digitalWrite(PIN_XSMT, auxOn ? HIGH : LOW);
-  Serial.printf("[OUT] динамики %s, AUX %s (штекер %s)\n", spkMuted ? "OFF" : "ON", auxOn ? "ON" : "OFF", auxPlug ? "есть" : "нет");
+  digitalWrite(PIN_SPK_MUTE, spkOn() ? LOW : HIGH);
+  digitalWrite(PIN_XSMT, auxOn() ? HIGH : LOW);
+  Serial.printf("[OUT] режим %s: динамики %s, AUX %s (штекер %s)\n", OUT_NAMES[outMode],
+                spkOn() ? "ON" : "OFF", auxOn() ? "ON" : "OFF", auxPlug ? "есть" : "нет");
   refreshBtn(B_SPK); refreshBtn(B_AUX);
+}
+
+void setOutMode(int m) {
+  if (m < OUT_SPK || m > OUT_BOTH) return;
+  outMode = m;
+  prefs.begin("seb", false);
+  if (prefs.getInt("out", -1) != m) prefs.putInt("out", m);   // пишем во флеш только если изменилось
+  prefs.end();
+  applyMutes();
+  refreshBtn(B_OSPK); refreshBtn(B_OAUX); refreshBtn(B_OBOTH);
+}
+
+// ---------- переключатель источника 74HC4053 (сам чип на со-процессоре) ----------
+// Голова говорит со-процессору, звучит ли S3 сейчас. Звучит -> 4053 на S3, иначе можно Bluetooth.
+bool s3BusyNow() { return isPlaying() || voiceBusy || plBusy || testBusy; }
+int s3BusySent = -1;
+void s3BusyReport(bool force) {
+  int b = s3BusyNow() ? 1 : 0;
+  if (!force && b == s3BusySent) return;
+  s3BusySent = b;
+  Serial1.printf("S3B %d\n", b);
 }
 
 unsigned long auxDetChange = 0;
@@ -1948,21 +2106,24 @@ void onBtn(Btn &b) {
     case B_PLAY:   togglePlay(); break;
     case B_VOLM:   volumeDown(); break;
     case B_VOLP:   volumeUp(); break;
+    case B_OSPK:   setOutMode(OUT_SPK); break;
+    case B_OAUX:   setOutMode(OUT_AUX); break;
+    case B_OBOTH:  setOutMode(OUT_BOTH); break;
     case B_SPK:    spkMuted = !spkMuted; applyMutes(); break;
     case B_AUX:    auxMuted = !auxMuted; applyMutes(); break;
     case B_AUXMUS: Serial1.println("MUSIC"); break;
-    case B_LR:     { bool was = loopMp3; lrTest(); if (was) startMp3(); } break;
-    case B_MIC:    { bool was = loopMp3; micTest(); if (was) startMp3(); } break;
+    case B_LR:     { bool was = loopMp3; testBusy = true; s3BusyReport(); lrTest(); testBusy = false; if (was) startMp3(); } break;
+    case B_MIC:    { bool was = loopMp3; testBusy = true; s3BusyReport(); micTest(); testBusy = false; if (was) startMp3(); } break;
     case B_LED:    Serial1.println("LED"); break;
     case B_BEEP:   Serial1.println("BEEP"); break;
     case B_CPOTA:  Serial1.println("OTA"); cpOta = 1; cpIp = ""; Serial.println("[OTA] -> со-процессор: режим прошивки"); break;
     case B_REBOOT: flashMsg("REBOOT...", TFT_RED); delay(300); ESP.restart(); break;
     case B_SRV:    srvPing(); break;
-    case B_ASK:    { bool was = loopMp3; voiceAsk(false); if (was) startMp3(); } break;
-    case B_KPOS:   kwsSeries(0); break;
-    case B_KNEG:   kwsSeries(1); break;
-    case B_KBG:    kwsBackground(); break;
-    case B_KPLAY:  kwsPlayLast(); break;
+    case B_ASK:    { bool was = loopMp3; testBusy = true; s3BusyReport(); voiceAsk(false); testBusy = false; if (was) startMp3(); } break;
+    case B_KPOS:   testBusy = true; s3BusyReport(); kwsSeries(0); testBusy = false; break;
+    case B_KNEG:   testBusy = true; s3BusyReport(); kwsSeries(1); testBusy = false; break;
+    case B_KBG:    testBusy = true; s3BusyReport(); kwsBackground(); testBusy = false; break;
+    case B_KPLAY:  testBusy = true; s3BusyReport(); kwsPlayLast(); testBusy = false; break;
     case B_KDEL:   kwsDelLast(); break;
     case B_KTIP:   kwsTip = (kwsTip + 1) % KWS_TIPS_N; break;
     case B_WAKE:   wakeOn = !wakeOn; if (wakeOn && !lsTask) listenStart(); goPage(page); break;
@@ -2006,9 +2167,168 @@ void pollTouch() {
 }
 
 // =====================================================================
+//  ЗАЩИТА АККУМА: глубокий сон по команде со-процессора
+// =====================================================================
+void sleepNow() {
+  pinMode(PIN_SPK_MUTE, OUTPUT); digitalWrite(PIN_SPK_MUTE, HIGH);   // MAX98357A молчат
+  pinMode(PIN_XSMT, OUTPUT);     digitalWrite(PIN_XSMT, LOW);        // PCM5102A молчит
+  pinMode(TFT_BL, OUTPUT);       digitalWrite(TFT_BL, LOW);          // подсветка экрана выкл
+  gpio_hold_en((gpio_num_t)PIN_SPK_MUTE);                            // держать эти уровни и во сне
+  gpio_hold_en((gpio_num_t)PIN_XSMT);
+  gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_deep_sleep_hold_en();
+  // ждём, пока со-процессор замолчит (иначе его строки сразу нас разбудят)
+  unsigned long t0 = millis(), quiet = millis();
+  while (millis() - t0 < 10000 && millis() - quiet < 1500) {
+    while (Serial1.available()) { Serial1.read(); quiet = millis(); }
+    delay(5);
+  }
+  headBatSleep = true;
+  // будильник: LOW на RX от со-процессора (он проснулся и что-то шлёт) или касание экрана (T_IRQ)
+  esp_sleep_enable_ext1_wakeup((1ULL << LINK_RX) | (1ULL << T_IRQ), ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);   // подтяжки работают во сне
+  rtc_gpio_pullup_en((gpio_num_t)LINK_RX);   rtc_gpio_pulldown_dis((gpio_num_t)LINK_RX);
+  rtc_gpio_pullup_en((gpio_num_t)T_IRQ);     rtc_gpio_pulldown_dis((gpio_num_t)T_IRQ);
+  Serial.println("[BAT] сплю. Разбудит со-процессор (зарядка) или касание экрана.");
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+void drawBatDead(int mv) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.drawString("BATAREYA", 120, 90, 4);
+  tft.drawString("SELA", 120, 120, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (mv > 0) { char b[16]; snprintf(b, sizeof(b), "%.2f V", mv / 1000.0f); tft.drawString(b, 120, 165, 4); }
+  tft.drawString("postav na zaryadku", 120, 210, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("vklyuchus sama ot 3.55 V", 120, 232, 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void batShutdown(int mv) {                         // "B,2,mV" от со-процессора (или связь пропала на низком)
+  Serial.printf("[BAT] аккум сел (%.2f В) — выключаюсь\n", mv / 1000.0f);
+  Serial1.print("SLEEP\n");                        // со-процессору: понял, можешь спать
+  Serial1.flush();
+  batLogFlush();                                   // дописать лог аккума на SD
+  wakeOn = false;                                  // слушатель больше не шлёт фразы
+  loopMp3 = false;
+  stopMp3();
+  digitalWrite(PIN_SPK_MUTE, HIGH);
+  digitalWrite(PIN_XSMT, LOW);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  drawBatDead(mv);
+  delay(3000);
+  sleepNow();
+}
+
+// Включили тумблером, а аккум «сел»: со-процессор шлёт "G,mV" и ждёт 12 с.
+// Экран с кнопкой на 5 с: нажал (или сенсор 2 на корпусе) -> "FORCE", работаем. Нет -> спать.
+unsigned long graceDoneMs = 0;
+void graceScreen(int mv) {
+  Serial.printf("[BAT] включили, аккум сел (%.2f В): 5 с на кнопку VKLYUCHIT'\n", mv / 1000.0f);
+  loopMp3 = false;
+  stopMp3();
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.drawString("BATAREYA SELA", 120, 40, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  char b[24]; snprintf(b, sizeof(b), "%.2f V", mv / 1000.0f);
+  tft.drawString(b, 120, 75, 4);
+  tft.drawString("zaryadka podklyuchena?", 120, 115, 2);
+  tft.fillRoundRect(20, 160, 200, 80, 10, TFT_DARKGREEN);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  tft.drawString("VKLYUCHIT'", 120, 188, 4);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("ili sensor 2 na korpuse", 120, 250, 2);
+  unsigned long t0 = millis();
+  int lastSec = -1;
+  bool forced = false;
+  char lb2[16]; int n = 0;
+  while (!forced && millis() - t0 < 5000) {
+    int sec = 5 - (millis() - t0) / 1000;
+    if (sec != lastSec) {
+      lastSec = sec;
+      char c[32]; snprintf(c, sizeof(c), "  inache splyu cherez %d s  ", sec);
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      tft.drawString(c, 120, 280, 2);
+    }
+    if (digitalRead(T_IRQ) == LOW) {
+      uint16_t x, y;
+      bool ok = tft.getTouch(&x, &y);
+      tft.drawPixel(239, 319, TFT_BLACK);          // «жертвенная» запись после getTouch
+      if (ok) { y = 319 - y; if (y >= 150 && y <= 250) forced = true; }
+    }
+    while (Serial1.available()) {                   // со-процессор: "F" = нажали сенсор 2
+      char c = Serial1.read();
+      if (c == '\n') { lb2[n] = 0; if (!strcmp(lb2, "F")) forced = true; n = 0; }
+      else if (c != '\r' && n < 15) lb2[n++] = c;
+    }
+    delay(20);
+  }
+  tft.setTextDatum(TL_DATUM);
+  graceDoneMs = millis();
+  if (forced) {
+    Serial1.print("FORCE\n");
+    Serial.println("[BAT] FORCE — работаем от зарядки (выключусь, если аккум < 3.0 В)");
+    goPage(page);
+    flashMsg("FORCE: rabotayu ot zaryadki", TFT_DARKGREEN);
+    return;
+  }
+  batShutdown(mv);
+}
+
+// Самое начало setup(): проснулись после сна из-за аккума — просыпаться совсем или спать дальше
+void bootGate() {
+  gpio_deep_sleep_hold_dis();                      // отпускаем пины, которые держали во сне
+  gpio_hold_dis((gpio_num_t)PIN_SPK_MUTE);
+  gpio_hold_dis((gpio_num_t)PIN_XSMT);
+  gpio_hold_dis((gpio_num_t)TFT_BL);
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) { headBatSleep = false; return; }
+  bool byTouch = esp_sleep_get_ext1_wakeup_status() & (1ULL << T_IRQ);
+  rtc_gpio_deinit((gpio_num_t)LINK_RX);            // вернуть пины из режима «будильника» в обычный
+  rtc_gpio_deinit((gpio_num_t)T_IRQ);
+  if (!headBatSleep) return;
+  Serial.printf("[BAT] проснулся: %s\n", byTouch ? "касание экрана" : "сигнал от со-процессора");
+  pinMode(PIN_SPK_MUTE, OUTPUT); digitalWrite(PIN_SPK_MUTE, HIGH);
+  pinMode(PIN_XSMT, OUTPUT);     digitalWrite(PIN_XSMT, LOW);
+  if (byTouch) { tft.init(); tft.setRotation(2); drawBatDead(0); }
+  else { pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, LOW); }
+  // со-процессор в обычном режиме шлёт "S,..." 5 раз в секунду — ждём до 4 с
+  Serial1.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
+  char b[16]; int n = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 4000) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      if (c == '\n') {
+        b[n] = 0;
+        if (!strncmp(b, "S,", 2) || !strncmp(b, "HELLO", 5)) {
+          headBatSleep = false;
+          Serial.println("[BAT] со-процессор проснулся (зарядка) — обычный старт");
+          return;
+        }
+        n = 0;
+      } else if (c != '\r' && n < 15) b[n++] = c;
+    }
+    delay(5);
+  }
+  Serial.println("[BAT] со-процессор спит — аккум всё ещё сел, сплю дальше");
+  sleepNow();
+}
+
+// =====================================================================
 //  UART-ЛИНК с со-процессором
 //  S3 -> ESP: PING n | BEEP | LED | MUSIC | RF n | RFHOLD | OTA
-//  ESP -> S3: S,... | T,n | P,n | R,n,code | L,n,code | U,code | X,n,code | W,st,pct,ip
+//  ESP -> S3: S,... | T,n | P,n | R,n,code | L,n,code | U,code | X,n,code | W,st,pct,ip | B,2,mV
+//  S3 -> ESP (ответ на B,2): SLEEP
+//  ESP -> S3: G,mV (включили на севшем аккуме, 5 с на кнопку) | F (нажали сенсор 2)
+//  S3 -> ESP: FORCE (нажали кнопку на экране) | SLEEP (не нажали)
+//  S3 -> ESP: S3B 1/0 — S3 сейчас звучит / молчит (для 74HC4053); S,... 9-е поле = mux (0 S3, 1 BT)
 // =====================================================================
 char lb[160];
 int ll = 0;
@@ -2018,7 +2338,9 @@ void handleLine(char *s) {
   rxLines++;
   if (s[0] == 'S' && s[1] == ',') {
     int oldMus = cpAuxMusic, oldMic = cpMicBtn;
-    sscanf(s + 2, "%d,%d,%d,%d,%d,%lu,%d,%d", &cpT1, &cpT2, &cpT3, &cpMicBtn, &cpBat, &cpUp, &cpBt, &cpAuxMusic);
+    int mux = -1;
+    sscanf(s + 2, "%d,%d,%d,%d,%d,%lu,%d,%d,%d", &cpT1, &cpT2, &cpT3, &cpMicBtn, &cpBat, &cpUp, &cpBt, &cpAuxMusic, &mux);
+    cpMux = mux;                                      // 9-е поле есть только у со-процессора v7.2+
     if (cpMicBtn && !oldMic && !voiceBusy) pttReq = true;   // нажали кнопку мика -> разговор
     if (oldMus != cpAuxMusic) refreshBtn(B_AUXMUS);
   } else if (s[0] == 'T' && s[1] == ',') {
@@ -2050,6 +2372,12 @@ void handleLine(char *s) {
     sscanf(s + 2, "%d,%d,%19s", &cpOta, &cpOtaPct, ip);
     cpIp = ip;
     if (old != cpOta) refreshBtn(B_CPOTA);
+  } else if (s[0] == 'G' && s[1] == ',') {          // G,mV — включили тумблером на севшем аккуме
+    if (!graceDoneMs || millis() - graceDoneMs > 15000) graceScreen(atoi(s + 2));
+  } else if (s[0] == 'B' && s[1] == ',') {          // B,2,mV — аккум сел, спать
+    int lvl = 0, mv = 0;
+    sscanf(s + 2, "%d,%d", &lvl, &mv);
+    if (lvl == 2) batShutdown(mv);
   } else if (s[0] == 'P' && s[1] == ',') {
     lastAck = strtoul(s + 2, nullptr, 10);
     lastAckMs = millis();
@@ -2075,12 +2403,16 @@ void setup() {
   rstReason = esp_reset_reason();
   if (rstReason == ESP_RST_POWERON) bootCount = 0;
   bootCount++;
-  Serial.println("\n\n===== SEBASTIAN BENCH v18: HEAD (ESP32-S3) =====");
+  Serial.println("\n\n===== SEBASTIAN BENCH v21: HEAD (ESP32-S3) =====");
   Serial.printf("[SYS] причина старта: %s, перезапуск #%lu\n", rstName(rstReason), (unsigned long)bootCount);
+  bootGate();                                      // спали из-за аккума? может, спим дальше
 
   pinMode(PIN_SPK_MUTE, OUTPUT);
   pinMode(PIN_XSMT, OUTPUT);
   pinMode(AUX_DET, INPUT_PULLUP);
+  prefs.begin("seb", true);                        // режим вывода звука из флеша (по умолчанию OBA)
+  outMode = constrain(prefs.getInt("out", OUT_BOTH), OUT_SPK, OUT_BOTH);
+  prefs.end();
   auxPlug = auxDetRaw = digitalRead(AUX_DET) == HIGH;
   applyMutes();
   pinMode(T_IRQ, INPUT_PULLUP);
@@ -2114,7 +2446,8 @@ void setup() {
   Serial.println("[SYS] готово. Сенсоры: 1=тише 2=play/stop 3=громче");
 }
 
-unsigned long tUi = 0, tLog = 0, tPing = 0;
+unsigned long tUi = 0, tLog = 0, tPing = 0, tLowBat = 0;
+int lastBat = 0;                                   // последнее известное напряжение аккума
 bool wasPlaying = false;
 
 void loop() {
@@ -2138,7 +2471,17 @@ void loop() {
   if (pttReq) { pttReq = false; bool was = loopMp3; voiceAsk(true); if (was) startMp3(); }
 
   if (millis() - tUi > 150) { tUi = millis(); updateHeader(); updatePage(); }
-  if (millis() - tPing > 1000) { tPing = millis(); Serial1.printf("PING %lu\n", ++pingSent); }
+  if (millis() - tPing > 1000) { tPing = millis(); Serial1.printf("PING %lu\n", ++pingSent); s3BusyReport(true); }
+  s3BusyReport();                                  // сразу сообщить, если S3 начал/перестал звучать
+  if (rxOk()) lastBat = cpBat;
+  batLogTick();
+  if (rxOk() && cpBat >= BAT_NONE && cpBat < BAT_LOW && millis() - tLowBat > 60000) {
+    tLowBat = millis();
+    char m[32]; snprintf(m, sizeof(m), "LOW BAT %.2fV - zaryadi!", cpBat / 1000.0f);
+    flashMsg(m, TFT_RED);
+  }
+  // запасной путь: "B,2" потерялся (голова была занята), со-процессор уже спит
+  if (!rxOk() && lastRxMs && millis() - lastRxMs > 30000 && lastBat >= BAT_NONE && lastBat < 3150) batShutdown(lastBat);
   if (millis() - tLog > 5000) {
     tLog = millis();
     Serial.printf("[STAT] mp3:%s vol:%.2f | link %s/%s | bat:%dmV | WiFi:%s\n",

@@ -1,5 +1,13 @@
 // =====================================================================
 //  СЕБАСТЬЯН — стендовый тест, СО-ПРОЦЕССОР (обычная ESP32)
+//  v7.2: 74HC4053 (выбор источника звука) — GPIO21: LOW = S3, HIGH = Bluetooth/мелодия со-процессора.
+//        Голова шлёт "S3B 1/0" (звучит/молчит). S3 звучит -> всегда S3 (голос важнее музыки).
+//        Иначе, если играет Bluetooth или тестовая мелодия -> BT. В "S,..." 9-е поле = mux.
+//  v7.1: флаг «аккум сел» хранится во флеше (NVS), а не в RTC — переживает выключение тумблером.
+//        Включили тумблером на севшем аккуме -> голове "G,mV", 12 с ждём "FORCE" (кнопка на экране)
+//        или касание сенсора 2 -> работаем (для зарядки). Нет -> спать дальше.
+//  v7: защита аккума: среднее за 10 с < 3.0 В -> голове "B,2" (до ответа "SLEEP", макс 20 с), глубокий сон.
+//      Во сне раз в минуту (или по сенсору 2) меряем аккум: >= 3.55 В (зарядка) -> обычный старт.
 //  v6.1: при старте на ленте крутится радуга (проверка прошивки по Wi-Fi).
 //  v6: прошивка по Wi-Fi (OTA): команда "OTA" с экрана головы -> BT выкл, Wi-Fi, 5 мин ждёт.
 //  v5.3: HOLD = код #1 три раза подряд (как 3 нажатия за секунду).
@@ -18,23 +26,41 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include "secrets.h"      // WIFI_SSID, WIFI_PASS, OTA_PASS — тот же файл, что у головы
+#include <esp_sleep.h>
+#include <Preferences.h>
+#include <driver/gpio.h>
 
 // ------------------------- ПИНЫ ESP32 --------------------------------
 #define PCM_BCK   26     // ВРЕМЕННО: PCM5102A напрямую (потом эти же пины уйдут в 74HC4053)
 #define PCM_LCK   25
 #define PCM_DIN   22
-#define LED_PIN   32     // ARGB -> 470 Ом -> 74AHCT125 -> лента
+#define LED_PIN   32     // ARGB -> 470 Ом -> Din ленты
 #define LED_COUNT 4      // сколько диодов в ленте
 #define TOUCH1    36     // VP  — сенсор 1 (тише)
 #define TOUCH2    35     // D35 — сенсор 2 (play/stop)
 #define TOUCH3    34     // D34 — сенсор 3 (громче)
 #define MIC_BTN   4      // кнопка мика на GND (пока не подключена)
 #define BAT_ADC   33     // делитель 1:2 от аккума
-#define MUX_SEL   21     // выбор 74HC4053 (пока чипа нет) — LOW = играет S3
+#define MUX_SEL   21     // выбор 74HC4053: LOW = играет S3, HIGH = играет Bluetooth (+10 кОм на GND)
 #define LINK_RX   16     // RX2 <- TX S3 (GPIO8)
 #define LINK_TX   17     // TX2 -> RX S3 (GPIO18)
 #define RF_RX     27     // приёмник 433 DATA (если RX питаешь 5V — через делитель 10к/20к!)
 #define RF_TX     13     // передатчик 433 DATA
+
+// ------------------------- БАТАРЕЯ: пороги (мВ, на одну банку) --------
+#define BAT_CAL_MV    0      // поправка АЦП: (мультиметр на B+) минус (что пишет экран). Пример: 3.92 − 3.87 -> 50
+#define BAT_NONE      2500   // ниже = аккума нет (стенд от USB) — защиту НЕ включаем
+#define BAT_LOW       3300   // предупреждение: красные вспышки, на экране LOW BAT
+#define BAT_OFF       3000   // среднее за 10 с ниже -> всё выключаем и спим (железная защита модуля — 2.5 В)
+#define BAT_WAKE      3550   // проснуться только выше этого (после нагрузки аккум «отпрыгивает» до ~3.3 В)
+#define SLEEP_CHECK_S 60     // во сне просыпаемся раз в минуту проверить аккум
+Preferences prefs;                     // NVS — маленькое хранилище во флеше, переживает выключение питания
+bool lowFlagGet() { prefs.begin("seb", true); bool v = prefs.getBool("lowbat", false); prefs.end(); return v; }
+void lowFlagSet(bool v) {                // пишем только если изменилось (флеш не любит лишних записей)
+  prefs.begin("seb", false);
+  if (prefs.getBool("lowbat", !v) != v) prefs.putBool("lowbat", v);
+  prefs.end();
+}
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 BluetoothA2DPSink a2dp;
@@ -98,8 +124,10 @@ void toneI2S(float freq, int ms, int amp = 7000) {
   }
 }
 
+int muxState = -1;                        // текущее положение 74HC4053: 0 = S3, 1 = BT
 void beepMelody() {
-  Serial.println("[AUX] мелодия в PCM5102A -> AUX");
+  Serial.println("[AUX] мелодия со-процессора");
+  digitalWrite(MUX_SEL, HIGH); muxState = -1;      // на время мелодии 4053 -> со-процессор, потом решит muxTick
   const float notes[] = {523.3f, 659.3f, 784.0f, 1046.5f};
   for (float f : notes) toneI2S(f, 140);
   toneI2S(0, 30);
@@ -161,6 +189,22 @@ void musicTick() {
   }
   size_t bw;
   i2s_write(I2S_NUM_0, buf, sizeof(buf), &bw, portMAX_DELAY);
+}
+
+// =====================================================================
+//  74HC4053: кто играет в динамики и AUX
+// =====================================================================
+bool s3Busy = false;
+unsigned long s3BusyMs = 0;                       // когда голова последний раз прислала S3B
+
+void muxTick() {
+  bool s3 = s3Busy && millis() - s3BusyMs < 3000; // голова молчит > 3 с (перезагрузка?) — не верим старому «звучит»
+  bool cp = btPlaying() || musicOn;               // со-процессору есть что играть
+  int want = (cp && !s3) ? 1 : 0;                 // голос/звук головы важнее музыки
+  if (want == muxState) return;
+  muxState = want;
+  digitalWrite(MUX_SEL, want ? HIGH : LOW);
+  Serial.printf("[MUX] 74HC4053 -> %s\n", want ? "BLUETOOTH" : "S3");
 }
 
 // =====================================================================
@@ -229,10 +273,22 @@ void pollInputs() {
   if (mb != micBtn) { micBtn = mb; Serial.printf("[BTN] кнопка мика: %s\n", mb ? "НАЖАТА" : "отпущена"); }
 }
 
-void readBattery() {
+int readBatNow() {
   uint32_t sum = 0;
   for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(BAT_ADC);
-  batmV = (int)(sum / 16) * 2;                     // делитель 1:2
+  int v = (int)(sum / 16) * 2;                     // делитель 1:2
+  return v < BAT_NONE ? v : v + BAT_CAL_MV;
+}
+
+// Среднее за 10 последних замеров (раз в секунду) — короткие просадки на басах не считаются
+int batRing[10], batN = 0, batI = 0;
+void readBattery() {
+  batRing[batI] = readBatNow();
+  batI = (batI + 1) % 10;
+  if (batN < 10) batN++;
+  long s = 0;
+  for (int i = 0; i < batN; i++) s += batRing[i];
+  batmV = s / batN;
 }
 
 // =====================================================================
@@ -315,6 +371,135 @@ void rfPoll() {
 }
 
 // =====================================================================
+//  ЗАЩИТА АККУМА: программное отключение на 3.0 В
+// =====================================================================
+bool linkStarted = false, rfStarted = false;
+
+void holdLow(int pin) {                           // пин держит LOW и во сне (иначе висит в воздухе)
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+  gpio_hold_en((gpio_num_t)pin);
+}
+
+void goSleep(bool announce) {
+  if (announce) {
+    Serial.printf("[BAT] аккум сел (%.2f В в среднем) — голове команда спать, потом сплю сам\n", batmV / 1000.0f);
+    musicOn = false;
+    holdLeft = 0;
+    strip.fill(strip.Color(255, 0, 0)); strip.show();
+    // шлём голове "B,2" каждые 0.3 с, пока не ответит "SLEEP" (голова могла быть занята разговором), макс 20 с
+    char rb[16]; int rn = 0; bool ack = false;
+    unsigned long t0 = millis();
+    while (!ack && millis() - t0 < 20000) {
+      Serial2.printf("B,2,%d\n", batmV);
+      unsigned long t1 = millis();
+      while (!ack && millis() - t1 < 300) {
+        while (Serial2.available()) {
+          char c = Serial2.read();
+          if (c == '\n') { rb[rn] = 0; if (!strncmp(rb, "SLEEP", 5)) ack = true; rn = 0; }
+          else if (c != '\r' && rn < 15) rb[rn++] = c;
+        }
+        delay(5);
+      }
+    }
+    Serial.println(ack ? "[BAT] голова ответила SLEEP" : "[BAT] голова молчит — сплю сам");
+    delay(300);
+  }
+  if (rfStarted) rf.disableReceive();             // приёмник включён только в обычном режиме
+  strip.begin();
+  strip.fill(0); strip.show();
+  if (linkStarted) { Serial2.flush(); Serial2.end(); }
+  pinMode(LINK_TX, INPUT_PULLUP);                 // TX отпускаем: у головы там подтяжка, лишний раз не будим
+  holdLow(RF_TX);                                  // передатчик 433 молчит
+  holdLow(LED_PIN);                                // лента не ловит мусор
+  gpio_deep_sleep_hold_en();
+  lowFlagSet(true);
+  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_CHECK_S * 1000000ULL);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)TOUCH2, 1);   // сенсор 2 (play) — проверить сразу
+  Serial.println("[BAT] сплю. Просыпаюсь раз в минуту или по сенсору 2.");
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// Включили тумблером на севшем аккуме: 12 с шлём голове "G,mV" и ждём FORCE / SLEEP / сенсор 2
+void graceWindow(int v) {
+  Serial2.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
+  linkStarted = true;
+  strip.begin(); strip.setBrightness(40);
+  Serial.println("[BAT] включили на севшем аккуме: жду кнопку на экране или сенсор 2 (до 12 с)");
+  char rb[16]; int rn = 0, res = 0;                 // res: 1 = работаем, 2 = спать
+  bool blink = false;
+  unsigned long t0 = millis(), tG = 0;
+  while (!res && millis() - t0 < 12000) {
+    if (millis() - tG > 300) {
+      tG = millis();
+      Serial2.printf("G,%d\n", v);
+      blink = !blink;
+      strip.fill(blink ? strip.Color(255, 90, 0) : 0); strip.show();   // оранжевое мигание = ждём решения
+    }
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      if (c == '\n') {
+        rb[rn] = 0;
+        if (!strncmp(rb, "FORCE", 5)) res = 1;
+        else if (!strncmp(rb, "SLEEP", 5)) res = 2;
+        rn = 0;
+      } else if (c != '\r' && rn < 15) rb[rn++] = c;
+    }
+    if (digitalRead(TOUCH2) == HIGH) { res = 1; Serial2.print("F\n"); }
+    delay(5);
+  }
+  strip.fill(0); strip.show();
+  if (res == 1) {
+    lowFlagSet(false);
+    Serial.println("[BAT] FORCE — работаем (выключусь, если среднее < 3.0 В)");
+    return;
+  }
+  Serial.println(res == 2 ? "[BAT] голова: спать" : "[BAT] никто не нажал — сплю");
+  goSleep(false);
+}
+
+// Самое начало setup(): если спали из-за аккума — решаем, просыпаться или спать дальше
+void bootGate() {
+  gpio_deep_sleep_hold_dis();                      // отпускаем пины, которые держали во сне
+  gpio_hold_dis((gpio_num_t)RF_TX);
+  gpio_hold_dis((gpio_num_t)LED_PIN);
+  esp_sleep_wakeup_cause_t w = esp_sleep_get_wakeup_cause();
+  if (!lowFlagGet()) return;                        // аккум в порядке — обычный старт
+  analogSetPinAttenuation(BAT_ADC, ADC_11db);
+  pinMode(TOUCH2, INPUT);
+  int v = readBatNow();
+  bool fromSleep = (w == ESP_SLEEP_WAKEUP_TIMER || w == ESP_SLEEP_WAKEUP_EXT0);
+  Serial.printf("[BAT] старт с флагом «сел» (%s): %.2f В\n",
+                w == ESP_SLEEP_WAKEUP_EXT0 ? "сенсор 2" : w == ESP_SLEEP_WAKEUP_TIMER ? "таймер" : "включили питание", v / 1000.0f);
+  if (v >= BAT_WAKE || v < BAT_NONE) {             // зарядился (или аккум отключён, питание от USB)
+    lowFlagSet(false);
+    Serial.println("[BAT] заряжается — обычный старт, будим голову");
+    return;
+  }
+  if (!fromSleep) { graceWindow(v); return; }       // включили тумблером — окно на кнопку
+  if (w == ESP_SLEEP_WAKEUP_EXT0) {                // тронули сенсор — показать, что сел
+    strip.begin(); strip.setBrightness(40);
+    for (int i = 0; i < 3; i++) { strip.fill(strip.Color(255, 0, 0)); strip.show(); delay(150); strip.fill(0); strip.show(); delay(150); }
+    unsigned long t0 = millis();
+    while (digitalRead(TOUCH2) == HIGH && millis() - t0 < 3000) delay(20);   // ждём, пока отпустят
+  }
+  goSleep(false);
+}
+
+void batTick() {
+  if (batN < 10 || millis() < 15000) return;       // нужно 10 с замеров после старта
+  if (batmV < BAT_NONE) return;                     // аккума нет (стенд от USB)
+  if (batmV < BAT_OFF) goSleep(true);
+  static unsigned long tWarn = 0;
+  if (batmV < BAT_LOW && millis() - tWarn > 30000) {
+    tWarn = millis();
+    Serial.printf("[BAT] мало заряда: %.2f В — поставь на зарядку\n", batmV / 1000.0f);
+    for (int i = 0; i < 2; i++) { strip.fill(strip.Color(255, 0, 0)); strip.show(); delay(120); strip.fill(0); strip.show(); delay(120); }
+  }
+}
+
+// =====================================================================
 //  OTA: прошивка по Wi-Fi. Bluetooth и Wi-Fi на одном радио мешают друг другу,
 //  поэтому на время прошивки BT выключаем, а потом плата перезагружается.
 // =====================================================================
@@ -381,6 +566,10 @@ void handleCmd(char *s) {
     Serial2.printf("P,%s\n", s[4] ? s + 5 : "0");
     return;
   }
+  if (!strncmp(s, "S3B ", 4)) {                   // S3B 1/0 — голова звучит/молчит (шлёт часто, без лога)
+    s3Busy = atoi(s + 4) != 0; s3BusyMs = millis();
+    return;
+  }
   if (otaMode) return;                            // в режиме прошивки остальные команды не выполняем
   Serial.printf("[LINK] команда от S3: %s\n", s);
   if (!strcmp(s, "BEEP")) beepMelody();
@@ -403,14 +592,17 @@ void pollLink() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n\n===== SEBASTIAN BENCH v6.1: CO-PROCESSOR (ESP32) =====");
+  Serial.println("\n\n===== SEBASTIAN BENCH v7.2: CO-PROCESSOR (ESP32) =====");
+  bootGate();                                             // спали из-за аккума? может, спим дальше
 
-  Serial2.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
+  if (!linkStarted) Serial2.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
+  linkStarted = true;
 
   for (int i = 0; i < 3; i++) pinMode(tPins[i], INPUT);   // 34/35/36 — только вход, без подтяжек
   pinMode(MIC_BTN, INPUT_PULLUP);
   pinMode(MUX_SEL, OUTPUT);
-  digitalWrite(MUX_SEL, LOW);                             // 4053 (когда будет): играет S3
+  digitalWrite(MUX_SEL, LOW);                             // 4053: по умолчанию играет S3
+  muxState = 0;
   analogSetPinAttenuation(BAT_ADC, ADC_11db);
 
   strip.begin();
@@ -418,6 +610,7 @@ void setup() {
   ledMode = 5;                                            // при старте — радуга (крутится в ledTick)
 
   rf.enableReceive(RF_RX);                        // на ESP32 номер прерывания = номер пина
+  rfStarted = true;
   rf.enableTransmit(RF_TX);
   rf.setProtocol(1);
   rf.setPulseLength(389);                          // ПОСЛЕ setProtocol (он сбрасывает длину)
@@ -446,6 +639,7 @@ void loop() {
   ledTick();
   rfPoll();
   rfHoldTick();
+  muxTick();
 
   static int lastBt = -1;
   int btNow = btPlaying() ? 2 : (btConnected() ? 1 : 0);
@@ -456,11 +650,12 @@ void loop() {
     if (btNow == 1) ledFill(strip.Color(0, 0, 255));      // подключился — лента синяя
   }
 
-  if (millis() - tBat > 1000) { tBat = millis(); readBattery(); }
+  if (millis() - tBat > 1000) { tBat = millis(); readBattery(); batTick(); }
   if (millis() - tStat > 200) {
     tStat = millis();
     int bt = btPlaying() ? 2 : (btConnected() ? 1 : 0);
-    Serial2.printf("S,%d,%d,%d,%d,%d,%lu,%d,%d\n", t[0], t[1], t[2], micBtn, batmV, millis() / 1000, bt, musicOn ? 1 : 0);
+    Serial2.printf("S,%d,%d,%d,%d,%d,%lu,%d,%d,%d\n", t[0], t[1], t[2], micBtn, batmV, millis() / 1000, bt, musicOn ? 1 : 0,
+                   muxState == 1 ? 1 : 0);
   }
   if (millis() - tLog > 2000) {
     tLog = millis();
