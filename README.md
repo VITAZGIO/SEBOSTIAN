@@ -40,10 +40,15 @@ UPS-модуль HW-465 (2×18650 параллельно, зарядка USB-C, 
 
 | Папка | Плата | Что |
 |---|---|---|
-| `S3/` | ESP32-S3-N16R8 (голова) | PlatformIO-проект головы |
-| `ESP32/` | ESP32 D0WD-V3 (со-процессор) | PlatformIO-проект со-процессора |
+| `ESP32_Sebostian/ESP32 S3/` | ESP32-S3-N16R8 (голова) | PlatformIO-проект головы (Arduino, текущая прошивка) |
+| `ESP32_Sebostian/ESP32/` | ESP32 D0WD-V3 (со-процессор) | PlatformIO-проект со-процессора (Arduino, текущая прошивка) |
+| `firmware/head/` | ESP32-S3-N16R8 (голова) | новая прошивка на ESP-IDF (в работе) |
+| `firmware/coproc/` | ESP32 D0WD-V3 (со-процессор) | новая прошивка на ESP-IDF (в работе) |
 
-В каждом проекте:
+Перенос на ESP-IDF идёт по фазам — ТЗ: [`TZ_ESP-IDF_Sebastian.md`](TZ_ESP-IDF_Sebastian.md).
+Arduino-прошивки остаются как аварийный откат (только по кабелю).
+
+В каждом Arduino-проекте:
 - `src/main.cpp` — прошивка
 - `src/secrets.h` — Wi-Fi и пароль OTA (**не в git**, шаблон: `src/secrets.example.h`)
 - `secrets.ini` — пароль OTA для заливки по Wi-Fi (**не в git**)

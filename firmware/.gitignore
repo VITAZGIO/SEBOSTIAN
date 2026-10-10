@@ -1,0 +1,15 @@
+# Секреты — в репозиторий не попадают (шаблон: secrets.example.h)
+**/main/secrets.h
+**/sdkconfig.secrets
+
+# Сборка ESP-IDF
+**/build/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+# dependencies.lock — КОММИТИТЬ (фиксирует версии компонентов)
+
+# Редактор
+**/.vscode/c_cpp_properties.json
+**/.vscode/launch.json
+**/.vscode/ipch
