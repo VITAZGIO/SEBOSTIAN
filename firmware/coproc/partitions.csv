@@ -1,0 +1,8 @@
+# Со-процессор, флеш 4 МБ: два слота по 1.875 МБ под OTA (A2DP + Wi-Fi + OTA должны влезть) и coredump.
+# Name,    Type, SubType,  Offset,   Size
+nvs,       data, nvs,      0x9000,   0x4000
+otadata,   data, ota,      0xD000,   0x2000
+phy_init,  data, phy,      0xF000,   0x1000
+ota_0,     app,  ota_0,    0x10000,  0x1E0000
+ota_1,     app,  ota_1,    0x1F0000, 0x1E0000
+coredump,  data, coredump, 0x3D0000, 0x10000

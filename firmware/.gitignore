@@ -4,10 +4,16 @@
 
 # Сборка ESP-IDF
 **/build/
+**/build_*/
 **/managed_components/
 **/sdkconfig
 **/sdkconfig.old
 # dependencies.lock — КОММИТИТЬ (фиксирует версии компонентов)
+
+# Тесты и симулятор экрана на ПК
+common/test/build/
+head/sim/build/
+head/sim/out/
 
 # Редактор
 **/.vscode/c_cpp_properties.json

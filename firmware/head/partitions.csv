@@ -1,0 +1,10 @@
+# Голова, флеш 16 МБ. Два слота по 4 МБ под OTA, coredump, остальное — на будущее.
+# Name,    Type, SubType,  Offset,   Size
+nvs,       data, nvs,      0x9000,   0x6000
+otadata,   data, ota,      0xF000,   0x2000
+phy_init,  data, phy,      0x11000,  0x1000
+ota_0,     app,  ota_0,    0x20000,  0x400000
+ota_1,     app,  ota_1,    0x420000, 0x400000
+model,     data, spiffs,   0x820000, 0x300000
+coredump,  data, coredump, 0xB20000, 0x10000
+storage,   data, fat,      0xB30000, 0x4D0000

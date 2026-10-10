@@ -1,0 +1,21 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 5.5.5
+  mdns:
+    component_hash: 4d705549e91ed65f537c7f19ec6d84ce7e139122dc302f8d74d99d32a7c5c757
+    dependencies:
+    - name: idf
+      version: '>=5.0'
+    source:
+      git: https://github.com/espressif/esp-protocols.git
+      path: components/mdns
+      type: git
+    version: e9d7350219dfb5e39eb56e5ef60c094190888c55
+direct_dependencies:
+- idf
+- mdns
+manifest_hash: 65060da3d0b43b2afbb712e684264a2f6d3776072bd2bd4100f09e09c9630693
+target: esp32
+version: 2.0.0

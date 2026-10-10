@@ -1,0 +1,13 @@
+# Зависимости — прямо с GitHub с фиксированными тегами (реестр Espressif не нужен).
+dependencies:
+  idf: ">=5.5"
+  lvgl:
+    git: https://github.com/lvgl/lvgl.git
+    version: v9.2.2
+  mdns:
+    git: https://github.com/espressif/esp-protocols.git
+    path: components/mdns
+    version: mdns-v1.8.2
+  libhelix-mp3:
+    git: https://github.com/chmorgan/esp-libhelix-mp3.git
+    version: v1.0.3
