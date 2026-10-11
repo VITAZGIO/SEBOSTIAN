@@ -3,6 +3,8 @@
 #include <math.h>
 #include "board.h"
 #include "cp.h"
+#include "alink.h"
+#include "seb_util.h"
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -17,7 +19,7 @@
 
 static const char *TAG = "bt";
 #define BT_NAME     "Sebastian"
-#define RB_SIZE     (32 * 1024)
+#define RB_SIZE     (24 * 1024)
 #define RB_PREFETCH (12 * 1024)       // ~70 мс: копим перед стартом, чтобы рывки пакетов BT не давали заиканий
 #define BLK         256              // стерео-кадров в блоке вывода
 
@@ -29,6 +31,21 @@ static volatile bool s_bt_on;
 static volatile bool s_beep_req, s_music;
 static bool s_bt_flowing;
 static char s_peer[32];
+// маршруты от головы (AROUTE). До первой команды — как раньше: Bluetooth только в AUX.
+static volatile bool s_bt_spk = false, s_bt_aux = true, s_head_aux = false;
+static volatile bool s_routes_seen;
+
+void bta_set_routes(bool bt_spk, bool bt_aux, bool head_aux)
+{
+    if (bt_spk != s_bt_spk || bt_aux != s_bt_aux || head_aux != s_head_aux)
+        ESP_LOGI(TAG, "маршруты: BT -> дин %d, AUX %d; голова -> AUX %d", bt_spk, bt_aux, head_aux);
+    s_bt_spk = bt_spk;
+    s_bt_aux = bt_aux;
+    s_head_aux = head_aux;
+    s_routes_seen = true;
+}
+bool bta_routes_seen(void) { return s_routes_seen; }
+int bta_rate(void) { return s_rate; }
 
 int bta_bt_state(void) { return s_state; }
 const char *bta_peer_name(void) { return s_peer; }
@@ -72,48 +89,101 @@ static void set_rate(int rate)
     ESP_LOGI(TAG, "I2S -> %d Гц", rate);
 }
 
+// ---------------- микшер AUX ----------------
+// Сумма: писк + Bluetooth (если маршрут BT -> AUX; приглушается, пока говорит голова) +
+// тестовая мелодия + звук головы по аудио-связи (48 кГц -> частота I2S, с подстройкой дрейфа часов).
+static seb_rs_t s_hrs;
+static int s_hrs_rate;
+static bool s_head_flow;
+
+static int head_pull(float *out, int frames, int rate)
+{
+    seb_ring_t *r = cpal_head_ring();
+    if (!r->buf) return 0;
+    if (rate != s_hrs_rate) { seb_rs_init(&s_hrs, 2, 48000, rate); s_hrs_rate = rate; s_head_flow = false; }
+    uint32_t fill = seb_ring_fill(r) / 2, target = 48000 / 25;      // держим ~40 мс
+    if (!s_head_flow) {
+        if (fill < target) return 0;
+        s_head_flow = true;
+    }
+    float err = ((float)fill - target) / target;
+    if (err > 1) err = 1;
+    if (err < -1) err = -1;
+    s_hrs.step = 48000.0 / rate * (1.0 + 0.003 * err);
+    int made = 0;
+    while (made < frames) {
+        const int16_t *p;
+        uint32_t n = seb_ring_peek(r, &p);
+        int inf = (int)(n / 2);
+        if (inf <= 0) break;
+        int used = 0;
+        int m = seb_rs_process(&s_hrs, p, inf, &used, out + 2 * made, frames - made);
+        seb_ring_consume(r, used * 2);
+        made += m;
+        if (!m && !used) break;
+    }
+    if (made < frames) s_head_flow = false;
+    return made;
+}
+
 static void out_task(void *arg)
 {
-    static int16_t buf[BLK * 2];
+    static int16_t buf[BLK * 2], bt[BLK * 2];
+    static float acc[BLK * 2], hd[BLK * 2];
     int beep_i = -1, beep_k = 0, note_i = 0, note_k = 0;
-    float ph = 0, mph = 0;
+    float ph = 0, mph = 0, duck = 1.0f;
     for (;;) {
         size_t wr;
-        // 1) писк (BEEP / старт) — поверх всего
+        set_rate(s_state >= 1 ? s_rate : 44100);
+        const int SR = s_rate_cur;
+        memset(acc, 0, sizeof(acc));
+        // 1) писк (BEEP / старт)
         if (s_beep_req) { s_beep_req = false; beep_i = 0; beep_k = 0; ph = 0; }
         if (beep_i >= 0) {
-            set_rate(44100);
-            const int SR = 44100, fade = SR / 200;
-            for (int i = 0; i < BLK; i++) {
+            const int fade = SR / 200;
+            for (int i = 0; i < BLK && beep_i >= 0; i++) {
                 float f = BEEP_NOTES[beep_i];
                 int total = SR * (f > 0 ? 140 : 30) / 1000;
                 float env = beep_k < fade ? (float)beep_k / fade : (beep_k > total - fade ? (float)(total - beep_k) / fade : 1.0f);
-                int16_t v = f > 0 ? (int16_t)(7000 * env * sinf(ph)) : 0;
+                float v = f > 0 ? 7000 * env * sinf(ph) : 0;
                 ph += 2.0f * (float)M_PI * f / SR;
                 if (ph > 2 * (float)M_PI) ph -= 2 * (float)M_PI;
-                buf[2 * i] = buf[2 * i + 1] = v;
-                if (++beep_k >= total) { beep_k = 0; ph = 0; if (++beep_i >= 5) { beep_i = -1; memset(buf + 2 * (i + 1), 0, (BLK - i - 1) * 4); break; } }
+                acc[2 * i] += v;
+                acc[2 * i + 1] += v;
+                if (++beep_k >= total) { beep_k = 0; ph = 0; if (++beep_i >= 5) beep_i = -1; }
             }
-            i2s_channel_write(s_tx, buf, sizeof(buf), &wr, portMAX_DELAY);
-            continue;
         }
-        // 2) Bluetooth (с предзагрузкой: начинаем играть, когда в кольце накопилось RB_PREFETCH)
+        // 2) Bluetooth в AUX (с предзагрузкой ~70 мс, чтобы рывки пакетов BT не давали заиканий)
         size_t fill = RB_SIZE - xRingbufferGetCurFreeSize(s_rb);
-        if (!s_bt_flowing && fill >= RB_PREFETCH) s_bt_flowing = true;
-        size_t got = 0;
-        void *p = s_bt_flowing ? xRingbufferReceiveUpTo(s_rb, &got, pdMS_TO_TICKS(20), BLK * 4) : NULL;
-        if (!p) s_bt_flowing = false;           // кольцо опустело — снова копим
-        if (p) {
-            set_rate(s_rate);
-            i2s_channel_write(s_tx, p, got, &wr, portMAX_DELAY);
-            vRingbufferReturnItem(s_rb, p);
-            continue;
+        if (!s_bt_aux) {                                    // BT не в AUX — старое из кольца выбросить
+            s_bt_flowing = false;
+            size_t g;
+            void *q;
+            while ((q = xRingbufferReceiveUpTo(s_rb, &g, 0, RB_SIZE))) vRingbufferReturnItem(s_rb, q);
         }
-        // 3) тестовая музыка (когда BT не играет)
+        else if (!s_bt_flowing && fill >= RB_PREFETCH) s_bt_flowing = true;
+        float dt = cpal_duck() ? 0.25f : 1.0f;
+        if (s_bt_flowing) {
+            size_t have = 0;
+            while (have < sizeof(bt)) {
+                size_t got = 0;
+                void *p = xRingbufferReceiveUpTo(s_rb, &got, pdMS_TO_TICKS(20), sizeof(bt) - have);
+                if (!p) break;
+                memcpy((uint8_t *)bt + have, p, got);
+                vRingbufferReturnItem(s_rb, p);
+                have += got;
+            }
+            if (have < sizeof(bt)) s_bt_flowing = false;      // кольцо опустело — снова копим
+            int nf = (int)(have / 4);
+            for (int i = 0; i < nf; i++) {
+                duck += (dt - duck) * 0.002f;
+                acc[2 * i] += bt[2 * i] * duck;
+                acc[2 * i + 1] += bt[2 * i + 1] * duck;
+            }
+        }
+        // 3) тестовая мелодия (когда BT не играет)
         if (s_music && s_state == 2) { s_music = false; ESP_LOGI(TAG, "пошёл Bluetooth — мелодия выкл"); }
         if (s_music) {
-            set_rate(44100);
-            const int SR = 44100;
             for (int i = 0; i < BLK; i++) {
                 const note_t *n = &SONG[note_i];
                 int total = SR * n->ms / 1000, att = SR / 100, rel = SR / 25;
@@ -125,15 +195,20 @@ static void out_task(void *arg)
                     mph += 2.0f * (float)M_PI * n->f / SR;
                     if (mph > 2 * (float)M_PI) mph -= 2 * (float)M_PI;
                 }
-                buf[2 * i] = buf[2 * i + 1] = (int16_t)(6000 * env * v);
+                acc[2 * i] += 6000 * env * v;
+                acc[2 * i + 1] += 6000 * env * v;
                 if (++note_k >= total) { note_k = 0; mph = 0; note_i = (note_i + 1) % SONG_LEN; }
             }
-            i2s_channel_write(s_tx, buf, sizeof(buf), &wr, portMAX_DELAY);
-            continue;
+        } else note_i = note_k = 0;
+        // 4) звук головы (голос Себастьяна, MP3) по аудио-связи
+        int nh = s_head_aux ? head_pull(hd, BLK, SR) : 0;
+        if (!s_head_aux && cpal_head_ring()->buf) seb_ring_clear(cpal_head_ring());
+        for (int i = 0; i < 2 * nh; i++) acc[i] += hd[i];
+        // сумма -> 16 бит (такт идёт всегда — PCM5102A так спокойнее)
+        for (int i = 0; i < 2 * BLK; i++) {
+            float v = acc[i];
+            buf[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
         }
-        note_i = note_k = 0;
-        // 4) тишина — такт идёт всегда (PCM5102A так спокойнее)
-        memset(buf, 0, sizeof(buf));
         i2s_channel_write(s_tx, buf, sizeof(buf), &wr, portMAX_DELAY);
     }
 }
@@ -154,6 +229,7 @@ void bta_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &sc));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     xTaskCreatePinnedToCore(out_task, "bt_out", 4096, NULL, 15, NULL, 1);
+    cpal_init();
     ESP_LOGI(TAG, "I2S0 -> PCM5102A (BCK %d, LCK %d, DIN %d)", PIN_PCM_BCK, PIN_PCM_LCK, PIN_PCM_DIN);
 }
 
@@ -223,7 +299,8 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
 {
     if (!s_rb || !len) return;
     // кольцо полное — выбрасываем (лучше щелчок, чем растущая задержка)
-    xRingbufferSend(s_rb, data, len, 0);
+    if (s_bt_aux) xRingbufferSend(s_rb, data, len, 0);
+    if (s_bt_spk) cpal_bt_push(data, len);          // в динамики головы — по аудио-связи
 }
 
 static void avrc_cb(esp_avrc_ct_cb_event_t ev, esp_avrc_ct_cb_param_t *p) { (void)ev; (void)p; }

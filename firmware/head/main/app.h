@@ -12,7 +12,7 @@ typedef enum {
     CMD_CPOTA, CMD_REBOOT,
     CMD_ASK, CMD_WAKE, CMD_PING, CMD_AEC,
     CMD_KPOS, CMD_KNEG, CMD_KBG, CMD_KPLAY, CMD_KDEL, CMD_KTIP,
-    CMD_OUT,            // arg = OUT_SPK/OUT_AUX/OUT_BOTH
+    CMD_ROUTE,          // arg = источник*10 + OUT_* (источник 0 = голова, 1 = Bluetooth)
     CMD_RF,             // arg = 1..21, 22 = HOLD
     CMD_HW_TOUCH,       // arg = сенсор 1..3
     CMD_PTT,            // нажали кнопку мика на со-процессоре

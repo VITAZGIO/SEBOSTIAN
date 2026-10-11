@@ -18,6 +18,7 @@
 #include "seb_ota.h"
 #include "seb_util.h"
 #include "seb_version.h"
+#include "alink.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
@@ -68,9 +69,14 @@ static btn_t s_btn[] = {
     {PG_AUDIO, 3, 244, 115, 40, CMD_AUX_MUSIC, 0, "МЕЛОДИЯ AUX", F14, NULL, NULL},
     {PG_AUDIO, 122, 244, 115, 40, CMD_LR_TEST, 0, "ТЕСТ L/R", F16, NULL, NULL},
     // OUTPUT
-    {PG_OUT, 10, 120, 220, 46, CMD_OUT, OUT_SPK, "ДИНАМИКИ", F24, NULL, NULL},
-    {PG_OUT, 10, 172, 220, 46, CMD_OUT, OUT_AUX, "AUX", F24, NULL, NULL},
-    {PG_OUT, 10, 224, 220, 46, CMD_OUT, OUT_BOTH, "ОБА", F24, NULL, NULL},
+    {PG_OUT, 3, 116, 56, 44, CMD_ROUTE, 0 + OUT_SPK, "ДИН", F16, NULL, NULL},
+    {PG_OUT, 62, 116, 56, 44, CMD_ROUTE, 0 + OUT_AUX, "AUX", F16, NULL, NULL},
+    {PG_OUT, 121, 116, 56, 44, CMD_ROUTE, 0 + OUT_BOTH, "ОБА", F16, NULL, NULL},
+    {PG_OUT, 180, 116, 57, 44, CMD_ROUTE, 0 + OUT_AUTO, "АВТО", F16, NULL, NULL},
+    {PG_OUT, 3, 190, 56, 44, CMD_ROUTE, 10 + OUT_SPK, "ДИН", F16, NULL, NULL},
+    {PG_OUT, 62, 190, 56, 44, CMD_ROUTE, 10 + OUT_AUX, "AUX", F16, NULL, NULL},
+    {PG_OUT, 121, 190, 56, 44, CMD_ROUTE, 10 + OUT_BOTH, "ОБА", F16, NULL, NULL},
+    {PG_OUT, 180, 190, 57, 44, CMD_ROUTE, 10 + OUT_AUTO, "АВТО", F16, NULL, NULL},
     // SENSORS
     {PG_SENS, 3, 240, 115, 40, CMD_LED, 0, "ЛЕНТА ДАЛЕЕ", F14, NULL, NULL},
     {PG_SENS, 122, 240, 115, 40, CMD_BEEP, 0, "БИП (AUX)", F16, NULL, NULL},
@@ -211,7 +217,7 @@ static uint32_t btn_color(const btn_t *b)
     case CMD_ASK: return voice_busy() ? COL_ORANGE : COL_DKGREEN;
     case CMD_WAKE: return g_set.wake_on ? COL_DKGREEN : 0x404040;
     case CMD_AEC: return (b->arg ? g_set.ns_on : g_set.aec_on) ? COL_DKGREEN : 0x404040;
-    case CMD_OUT: return g_set.out_mode == b->arg ? COL_DKGREEN : COL_BTN;
+    case CMD_ROUTE: return (b->arg / 10 ? g_set.route_bt : g_set.route_head) == b->arg % 10 ? COL_DKGREEN : COL_BTN;
     case CMD_RF: return b->arg == 22 ? COL_DKRED : COL_BTN;
     default: return COL_BTN;
     }
@@ -362,8 +368,7 @@ static void page_audio(void)
         snprintf(b, sizeof(b), "SD: %lu МБ  test.mp3: %s", (unsigned long)sdcard_size_mb(), f ? "ЕСТЬ" : "НЕТ");
         line(PG_AUDIO, 1, b, f ? COL_GREEN : COL_YELLOW);
     }
-    static const char *ON[3] = {"ДИН", "AUX", "ОБА"};
-    snprintf(b, sizeof(b), "%s: дин %s, AUX %s, шт. %s", ON[g_set.out_mode], audio_spk_on() ? "ВКЛ" : "выкл",
+    snprintf(b, sizeof(b), "динамики %s, AUX %s, штекер %s", audio_spk_on() ? "ВКЛ" : "выкл",
              audio_aux_on() ? "ВКЛ" : "выкл", g_st.aux_plug ? "ДА" : "нет");
     line(PG_AUDIO, 2, b, COL_WHITE);
     if (!g_st.mic_ok) line(PG_AUDIO, 3, "МИКР: I2S ОШИБКА", COL_RED);
@@ -379,22 +384,36 @@ static void page_audio(void)
     line(PG_AUDIO, 4, b, g_st.cp_bt ? COL_CYAN : COL_WHITE);
 }
 
+static const char *route_text(bool spk, bool aux)
+{
+    return spk && aux ? "динамики + AUX" : aux ? "AUX" : spk ? "динамики" : "никуда";
+}
+
 static void page_out(void)
 {
     char b[96];
-    static const char *N[3] = {"ДИНАМИКИ", "AUX", "ОБА"};
-    snprintf(b, sizeof(b), "ВЫВОД: %s", N[g_set.out_mode]);
+    audio_route_t r;
+    audio_routes(&r);
+    snprintf(b, sizeof(b), "СЕБАСТЬЯН → %s%s", route_text(r.head_spk, r.head_aux), g_set.route_head == OUT_AUTO ? " (авто)" : "");
     line(PG_OUT, 0, b, COL_CYAN);
-    snprintf(b, sizeof(b), "динамики: %s   AUX: %s", audio_spk_on() ? "ИГРАЮТ" : "молчат", audio_aux_on() ? "ИГРАЕТ" : "молчит");
-    line(PG_OUT, 1, b, COL_WHITE);
-    if (g_set.out_mode != OUT_SPK && !g_st.aux_plug) line(PG_OUT, 2, "штекер AUX не вставлен -> динамики", COL_YELLOW);
+    snprintf(b, sizeof(b), "BLUETOOTH → %s%s  (%s)", route_text(r.bt_spk, r.bt_aux), g_set.route_bt == OUT_AUTO ? " (авто)" : "",
+             bt_text());
+    line(PG_OUT, 1, b, g_st.cp_bt == 2 ? COL_GREEN : COL_WHITE);
+    if (g_st.spk_muted || g_st.aux_muted) line(PG_OUT, 2, "внимание: включён МЬЮТ на странице ЗВУК", COL_RED);
     else {
         snprintf(b, sizeof(b), "штекер AUX: %s", g_st.aux_plug ? "вставлен" : "нет");
         line(PG_OUT, 2, b, g_st.aux_plug ? COL_GREEN : COL_GREY);
     }
-    snprintf(b, sizeof(b), "в AUX: Bluetooth (%s)", bt_text());
-    line(PG_OUT, 3, b, g_st.cp_bt == 2 ? COL_CYAN : COL_WHITE);
-    line(PG_OUT, 4, (g_st.spk_muted || g_st.aux_muted) ? "внимание: включён МЬЮТ на странице ЗВУК" : "", COL_RED);
+    // здоровье аудио-связи (провода 23->1 и 46->19)
+    bool bt_wait = r.bt_spk && g_st.cp_bt == 2 && now_ms() - alink_bt_last_ms() > 1500;
+    if (strncmp(g_st.cp_ver, "c-idf", 5)) line(PG_OUT, 3, "сопроц. Arduino: маршруты не работают", COL_YELLOW);
+    else if (bt_wait) line(PG_OUT, 3, "НЕТ Bluetooth по проводу 23 → 1!", COL_RED);
+    else {
+        snprintf(b, sizeof(b), "провод: BT %lu ош%lu, AUX %lu ош%lu", (unsigned long)g_st.al_rx_ok,
+                 (unsigned long)(g_st.al_rx_crc + g_st.al_rx_lost), (unsigned long)g_st.cp_al_ok,
+                 (unsigned long)(g_st.cp_al_crc + g_st.cp_al_lost));
+        line(PG_OUT, 3, b, COL_GREY);
+    }
 }
 
 static void page_sens(void)
@@ -651,6 +670,15 @@ void ui_init(void)
     lv_obj_set_style_radius(s_micbar, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_micbar, lv_color_hex(0x202020), 0);
     lv_obj_set_style_bg_opa(s_micbar, LV_OPA_COVER, 0);
+    // OUTPUT: подписи групп
+    mk_label(s_page[PG_OUT], 3, 96 - 22, 234, F14, 0xC0C0C0);
+    lv_label_set_text(lv_obj_get_child(s_page[PG_OUT], -1), "Себастьян, музыка с SD, звуки:");
+    mk_label(s_page[PG_OUT], 3, 170 - 22, 234, F14, 0xC0C0C0);
+    lv_label_set_text(lv_obj_get_child(s_page[PG_OUT], -1), "Bluetooth (телефон):");
+    lv_obj_t *hint = mk_label(s_page[PG_OUT], 3, 240 - 22, 234, F14, COL_GREY);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(hint, "АВТО: штекер в AUX → AUX,\nнет штекера → динамики");
+
     // SENSORS: круги
     static const char *CN[4] = {"T1", "T2", "T3", "МИК"};
     for (int i = 0; i < 4; i++) {

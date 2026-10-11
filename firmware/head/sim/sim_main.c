@@ -55,7 +55,8 @@ int main(void)
     g_set.srv_port = 9010;
     g_set.volume = 0.30f;
     g_set.spk_ceil = 0.35f;
-    g_set.out_mode = OUT_BOTH;
+    g_set.route_head = OUT_AUTO;
+    g_set.route_bt = OUT_SPK;
     g_set.wake_on = true;
     g_set.aec_on = true;
     g_st.head_ota_pct = -1;
@@ -77,7 +78,8 @@ int main(void)
     strcpy(g_st.kws_info, "pos/p_0037.wav  пик 9120  ok");
     strcpy(g_st.kws_big, "СЕБАСТЬЯН"); strcpy(g_st.kws_small, "после «пик» — 3/10  (тап = стоп)"); g_st.kws_prompt_col = COL_GREEN;
     g_st.aec_ok = true; g_st.aec_erle_db = 18; g_st.aec_delay_ms = 22;
-    strcpy(g_st.cp_ver, "c-idf-0.1");
+    strcpy(g_st.cp_ver, "c-idf-0.2");
+    g_st.al_rx_ok = 15234; g_st.cp_al_ok = 4410; g_st.cp_al_crc = 2;
 
     ui_init();
     static const char *N[8] = {"1_home", "2_voice", "3_train", "4_audio", "5_output", "6_sensors", "7_radio", "8_system"};

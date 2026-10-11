@@ -32,6 +32,10 @@ bool link_tx_ok(void) { return true; }
 void app_post(app_cmd_t c, int arg) { (void)c; (void)arg; }
 bool disp_lock(int t) { (void)t; return true; }
 void disp_unlock(void) {}
+#include "audio.h"
+#include "alink.h"
+void audio_routes(audio_route_t *r) { r->head_spk = !g_st.aux_plug; r->head_aux = g_st.aux_plug; r->bt_spk = true; r->bt_aux = false; }
+int64_t alink_bt_last_ms(void) { return sim_now; }
 bool audio_spk_on(void) { return true; }
 bool audio_aux_on(void) { return g_st.aux_plug; }
 bool mp3_playing(void) { return true; }

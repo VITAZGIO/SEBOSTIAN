@@ -192,8 +192,13 @@ void listener_tick(void)
         // без эхоподавления: пока играет свой звук — не слушаем (как в Arduino)
         hold = hold || audio_active() || audio_src_busy(SRC_TTS) || audio_src_busy(SRC_FX) || mp3_playing() || voice_busy();
     }
-    // Bluetooth/мелодия со-процессора идут в AUX мимо reference — их AEC не вычтет
-    hold = hold || (audio_aux_on() && (g_st.cp_bt == 2 || g_st.cp_music));
+    // Всё, что звучит из AUX (внешний усилитель), идёт мимо reference — его AEC не вычтет: не слушаем.
+    // (Bluetooth в динамиках — можно: он в reference.)
+    audio_route_t rt;
+    audio_routes(&rt);
+    bool aux_live = g_st.aux_plug && audio_aux_on();
+    hold = hold || (aux_live && rt.bt_aux && g_st.cp_bt == 2) || (aux_live && g_st.cp_music) ||
+           (aux_live && rt.head_aux && audio_head_active());
     s_hold = hold;
     if (g_st.ls_mode == LM_CMD && g_st.ls_state == 0 && !hold && now_ms() > s_cmd_deadline) {
         g_st.ls_mode = LM_WAKE;

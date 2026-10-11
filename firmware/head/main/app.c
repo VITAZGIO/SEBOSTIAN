@@ -49,6 +49,32 @@ static void post_job(job_type_t t)
     if (!voice_post(&j)) st_flash(COL_YELLOW, "Занят — подожди");
 }
 
+// Сказать со-процессору, куда что играть: AROUTE bt_spk,bt_aux,head_aux (при изменении и раз в 2 с —
+// на случай, если он перезагрузился). Старый Arduino-со-процессор строку игнорирует.
+static void send_routes(bool force)
+{
+    static int last = -1;
+    static int64_t t_last;
+    audio_route_t r;
+    audio_routes(&r);
+    int v = r.bt_spk | r.bt_aux << 1 | r.head_aux << 2;
+    if (!force && v == last && now_ms() - t_last < 2000) return;
+    if (strncmp(g_st.cp_ver, "c-idf", 5)) { last = -1; return; }      // со-процессор не IDF — ему не нужно
+    last = v;
+    t_last = now_ms();
+    link_send("AROUTE %d,%d,%d", r.bt_spk, r.bt_aux, r.head_aux);
+}
+
+// Приглушить Bluetooth в AUX, пока говорят (в динамиках голова приглушает сама)
+static void send_duck(void)
+{
+    static int last = -1;
+    int v = audio_voice_active() ? 1 : 0;
+    if (v == last || strncmp(g_st.cp_ver, "c-idf", 5)) return;
+    last = v;
+    link_send("DUCK %d", v);
+}
+
 static void handle(const msg_t *m)
 {
     switch (m->c) {
@@ -95,13 +121,17 @@ static void handle(const msg_t *m)
         else g_set.aec_on = !g_set.aec_on;
         settings_save();
         break;
-    case CMD_OUT:
-        if (m->arg >= OUT_SPK && m->arg <= OUT_BOTH && g_set.out_mode != m->arg) {
-            g_set.out_mode = m->arg;
+    case CMD_ROUTE: {
+        int src = m->arg / 10, mode = m->arg % 10;
+        if (mode < OUT_SPK || mode > OUT_AUTO) break;
+        int *r = src ? &g_set.route_bt : &g_set.route_head;
+        if (*r != mode) {
+            *r = mode;
             settings_save();
             audio_apply_outputs();
+            send_routes(true);
         }
-        break;
+    } break;
     case CMD_RF:
         if (m->arg >= 1 && m->arg <= 21) {
             link_send("RF %d", m->arg);
@@ -143,6 +173,8 @@ static void app_task(void *arg)
             audio_apply_outputs();
         }
         listener_tick();
+        send_routes(false);
+        send_duck();
         if (now - t_sec >= 1000) {
             t_sec = now;
             link_send("PING %lu", (unsigned long)++g_st.ping_sent);

@@ -2,10 +2,13 @@
 // Голова: h-idf-0.N, со-процессор: c-idf-0.N. Менять при каждой сборке, которую отдаём на стенд.
 #pragma once
 
-#define SEB_HEAD_VERSION   "h-idf-0.1"
-#define SEB_COPROC_VERSION "c-idf-0.1"
+#define SEB_HEAD_VERSION   "h-idf-0.2"
+#define SEB_COPROC_VERSION "c-idf-0.2"
 
 // История:
+//  0.2 — аудио-связь между платами (2 новых провода, UART 3 Мбит/с): Bluetooth в динамики,
+//        голос/музыка головы в AUX; маршруты «Себастьян» и «Bluetooth»: ДИН/AUX/ОБА/АВТО (по штекеру),
+//        приглушение Bluetooth, пока говорят (DUCK); строки AROUTE/DUCK/A в протоколе.
 //  0.1 — первый перенос на ESP-IDF v5.5.5: OTA с автооткатом, LVGL + кириллица,
 //        микшер 48 кГц, MP3, голос (ASK/PTT/«Себастьян»), AEC (ESP-SR), TRAIN,
 //        лог батареи, защита батареи и сон, со-процессор (A2DP, радио 433 на RMT, ARGB).

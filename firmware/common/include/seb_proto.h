@@ -27,6 +27,7 @@ typedef enum {
     CP_HELLO,       // HELLO ...
     CP_VERSION,     // V,версия  (новое)
     CP_CFG_REQ,     // CFG?      (новое: со-процессор просит Wi-Fi для OTA)
+    CP_ALINK,       // A,ok,crc,lost (новое: статистика приёма аудио голова -> AUX)
     CP_UNKNOWN,
 } seb_cp_type_t;
 
@@ -41,6 +42,7 @@ typedef struct {
     uint32_t code;
     int ota_state, ota_pct;
     int bat_level;
+    uint32_t a_ok, a_crc, a_lost;   // A,...
     char text[40];          // ip (W), версия (V), остаток строки (HELLO)
 } seb_cp_msg_t;
 
@@ -60,12 +62,15 @@ typedef enum {
     HC_FORCE,       // FORCE
     HC_S3B,         // S3B 0/1 (устарело, принимаем молча)
     HC_CFG,         // CFG <hex ssid> <hex pass> <hex ota> (новое)
+    HC_AROUTE,      // AROUTE bt_spk,bt_aux,head_aux (новое: куда что играет, 0/1)
+    HC_DUCK,        // DUCK 0/1 (новое: Себастьян/человек говорит — приглуши Bluetooth)
     HC_UNKNOWN,
 } seb_hc_type_t;
 
 typedef struct {
     seb_hc_type_t type;
     uint32_t n;
+    int bt_spk, bt_aux, head_aux;   // AROUTE
     char ssid[33];
     char pass[65];
     char ota[65];

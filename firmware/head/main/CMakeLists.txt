@@ -1,7 +1,7 @@
 file(GLOB FONTS "fonts/*.c")
 idf_component_register(
     SRCS "main.c" "state.c" "settings.c" "sysmon.c" "net.c" "web.c" "display.c" "ui.c" "app.c" "link.c"
-         "audio.c" "mp3.c" "fx.c" "mic.c" "voice.c" "listener.c" "train.c" "batlog.c" "power.c" "sdcard.c"
+         "audio.c" "alink.c" "mp3.c" "fx.c" "mic.c" "voice.c" "listener.c" "train.c" "batlog.c" "power.c" "sdcard.c"
          ${FONTS}
     INCLUDE_DIRS "."
     REQUIRES common lvgl libhelix-mp3 mdns sr_lite esp_lcd esp_driver_spi esp_driver_i2s esp_driver_gpio

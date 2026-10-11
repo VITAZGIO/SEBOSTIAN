@@ -2,6 +2,7 @@
 #include "unity.h"
 #include "seb_proto.h"
 #include "seb_util.h"
+#include "seb_alink.h"
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
@@ -85,6 +86,70 @@ static void test_head_cmds(void)
     TEST_ASSERT_EQUAL_STRING("p@ss word", h.pass);
     TEST_ASSERT_EQUAL_STRING("", h.ota);
     TEST_ASSERT_EQUAL(-1, seb_proto_fmt_cfg(line, 10, "abc", "def", "ghi"));
+}
+
+static void test_route_and_alink_lines(void)
+{
+    seb_hc_msg_t h;
+    TEST_ASSERT_TRUE(seb_proto_parse_hc("AROUTE 1,0,1", &h));
+    TEST_ASSERT_EQUAL(HC_AROUTE, h.type);
+    TEST_ASSERT_EQUAL(1, h.bt_spk);
+    TEST_ASSERT_EQUAL(0, h.bt_aux);
+    TEST_ASSERT_EQUAL(1, h.head_aux);
+    TEST_ASSERT_TRUE(seb_proto_parse_hc("DUCK 1", &h));
+    TEST_ASSERT_EQUAL(HC_DUCK, h.type);
+    TEST_ASSERT_EQUAL_UINT32(1, h.n);
+    seb_cp_msg_t m;
+    TEST_ASSERT_TRUE(seb_proto_parse_cp("A,1200,3,7", &m));
+    TEST_ASSERT_EQUAL(CP_ALINK, m.type);
+    TEST_ASSERT_EQUAL_UINT32(1200, m.a_ok);
+    TEST_ASSERT_EQUAL_UINT32(3, m.a_crc);
+    TEST_ASSERT_EQUAL_UINT32(7, m.a_lost);
+}
+
+// ---------- аудио-связь ----------
+static int g_pk;
+static uint32_t g_sum;
+static void on_pkt(const seb_apkt_t *p, void *ctx)
+{
+    (void)ctx;
+    g_pk++;
+    TEST_ASSERT_EQUAL(SEB_ALINK_T_PCM, p->type);
+    TEST_ASSERT_EQUAL(44100, p->rate);
+    for (int i = 0; i < p->len; i++) g_sum += p->payload[i];
+}
+
+static void test_alink(void)
+{
+    static uint8_t stream[20 * (SEB_ALINK_MAX_PAYLOAD + SEB_ALINK_OVERHEAD) + 100];
+    uint8_t pl[SEB_ALINK_MAX_PAYLOAD];
+    size_t n = 0;
+    uint32_t want = 0;
+    stream[n++] = 0x5A;                                  // мусор перед первым пакетом
+    stream[n++] = 0xA5;
+    stream[n++] = 0x00;
+    for (int k = 0; k < 20; k++) {
+        for (int i = 0; i < (int)sizeof(pl); i++) pl[i] = (uint8_t)(i * 7 + k);
+        if (k == 5) continue;                            // пакет 5 «потерян»
+        size_t at = n;
+        n += seb_alink_pack(stream + n, SEB_ALINK_T_PCM, 0, 44100, (uint16_t)k, pl, sizeof(pl));
+        if (k == 9) stream[at + 300] ^= 0x40;            // пакет 9 испорчен — CRC не сойдётся
+        else for (int i = 0; i < (int)sizeof(pl); i++) want += pl[i];
+    }
+    seb_alink_rx_t rx;
+    seb_alink_rx_init(&rx);
+    g_pk = 0;
+    g_sum = 0;
+    for (size_t off = 0; off < n;) {                    // кормим кусками случайной длины
+        size_t k = 1 + (size_t)(rand() % 700);
+        if (off + k > n) k = n - off;
+        seb_alink_rx_feed(&rx, stream + off, k, on_pkt, NULL);
+        off += k;
+    }
+    TEST_ASSERT_EQUAL(18, g_pk);
+    TEST_ASSERT_EQUAL_UINT32(want, g_sum);
+    TEST_ASSERT_EQUAL_UINT32(1, rx.crc_err);
+    TEST_ASSERT_EQUAL_UINT32(2, rx.lost);               // 5 потерян, 9 испорчен
 }
 
 // ---------- текст ----------
@@ -348,6 +413,8 @@ int main(void)
     RUN_TEST(test_status_old_and_new);
     RUN_TEST(test_events);
     RUN_TEST(test_head_cmds);
+    RUN_TEST(test_route_and_alink_lines);
+    RUN_TEST(test_alink);
     RUN_TEST(test_b64);
     RUN_TEST(test_json);
     RUN_TEST(test_linebuf);

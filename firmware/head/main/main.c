@@ -19,6 +19,7 @@
 #include "link.h"
 #include "sdcard.h"
 #include "audio.h"
+#include "alink.h"
 #include "mp3.h"
 #include "mic.h"
 #include "voice.h"
@@ -128,6 +129,7 @@ void app_main(void)
     link_start();
     g_st.aux_plug = gpio_get_level(PIN_AUX_DET) == 1;
     g_st.sd_ok = sdcard_init();
+    alink_init();
     audio_init();
     mp3_init();
     g_st.mic_ok = mic_init();

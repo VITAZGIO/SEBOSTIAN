@@ -37,6 +37,12 @@
 #define PIN_LINK_RX     18      // <- ESP32 TX2 (17)
 #define LINK_UART       UART_NUM_1
 
+// Аудио-связь с со-процессором — отдельный быстрый UART2 (3 Мбит/с), два новых провода:
+#define PIN_ALINK_RX    1       // <- со-процессор GPIO23: Bluetooth-звук в динамики
+#define PIN_ALINK_TX    46      // -> со-процессор GPIO19: голос/музыка головы в AUX
+                                //    (46 — strapping: при старте должен быть LOW, у со-процессора на 19 подтяжка вниз)
+#define ALINK_UART      UART_NUM_2
+
 #define PIN_RGB_LED     48      // бортовой WS2812 — гасим при старте
 
 // Калибровка тача (сырые XPT2046, сняты в Arduino при rotation 0, TFT_eSPI {460, 3320, 340, 3430, 1}):

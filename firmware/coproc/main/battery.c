@@ -4,6 +4,7 @@
 #include "cp.h"
 #include "led.h"
 #include "rf433.h"
+#include "alink.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_adc/adc_oneshot.h"
@@ -74,6 +75,7 @@ void bat_go_sleep(bool announce)
     }
     rf433_rx_enable(false);
     led_hold_low_for_sleep();                     // лента не ловит мусор
+    cpal_sleep();                                 // аудио-связь: TX отпускаем, RX держим вниз (strapping головы)
     link_stop_for_sleep();                        // TX отпускаем: у головы там подтяжка, лишний раз не будим
     hold_low(PIN_RF_TX);                          // передатчик 433 молчит
     gpio_deep_sleep_hold_en();

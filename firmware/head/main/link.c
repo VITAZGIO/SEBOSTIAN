@@ -145,6 +145,11 @@ static void handle(const char *s)
         ESP_LOGI(TAG, "версия со-процессора: %s", m.text);
         if (!strncmp(m.text, "c-idf", 5)) link_send_cfg();
         break;
+    case CP_ALINK:
+        g_st.cp_al_ok = m.a_ok;
+        g_st.cp_al_crc = m.a_crc;
+        g_st.cp_al_lost = m.a_lost;
+        break;
     case CP_CFG_REQ:
         link_send_cfg();
         break;

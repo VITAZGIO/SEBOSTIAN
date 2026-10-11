@@ -13,6 +13,7 @@
 #include "btaudio.h"
 #include "battery.h"
 #include "otamode.h"
+#include "alink.h"
 #include "seb_ota.h"
 #include "seb_logbuf.h"
 #include "seb_version.h"
@@ -177,6 +178,7 @@ void app_main(void)
         if (t - t_log >= 2000) {
             t_log = t;
             if (t > 60000) s_crash = 0;
+            if (bta_routes_seen()) cpal_report();        // статистика аудио-связи для головы
             ESP_LOGI(TAG, "T:%d%d%d мик:%d акк:%.2fВ BT:%s музыка:%d | от головы: %s (PING %lu)", g_t[0], g_t[1], g_t[2],
                      g_mic_btn, g_bat_mv / 1000.0f, bt == 2 ? "play" : bt == 1 ? "conn" : "wait", bta_music_on(),
                      (g_last_ping_ms && t - g_last_ping_ms < 2500) ? "OK" : "НЕТ (провод S3 8 -> ESP 16?)",

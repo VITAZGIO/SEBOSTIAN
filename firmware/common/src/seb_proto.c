@@ -85,6 +85,11 @@ bool seb_proto_parse_cp(const char *s, seb_cp_msg_t *m)
         case 'V':
             m->type = CP_VERSION; copy_str(m->text, sizeof(m->text), p);
             return true;
+        case 'A':
+            k = seb_csv_ints(p, v, 3);
+            if (k < 3) break;
+            m->type = CP_ALINK; m->a_ok = (uint32_t)v[0]; m->a_crc = (uint32_t)v[1]; m->a_lost = (uint32_t)v[2];
+            return true;
         default:
             break;
         }
@@ -140,6 +145,16 @@ bool seb_proto_parse_hc(const char *s, seb_hc_msg_t *m)
     if (!strcmp(s, "OTA")) { m->type = HC_OTA; return true; }
     if (!strncmp(s, "SLEEP", 5)) { m->type = HC_SLEEP; return true; }
     if (!strncmp(s, "FORCE", 5)) { m->type = HC_FORCE; return true; }
+    if (!strncmp(s, "DUCK", 4)) { m->type = HC_DUCK; m->n = s[4] ? strtoul(s + 5, NULL, 10) : 0; return true; }
+    if (!strncmp(s, "AROUTE", 6)) {
+        long v[3] = {0, 1, 0};
+        if (seb_csv_ints(s[6] == ' ' ? s + 7 : s + 6, v, 3) < 0) return false;
+        m->type = HC_AROUTE;
+        m->bt_spk = v[0] != 0;
+        m->bt_aux = v[1] != 0;
+        m->head_aux = v[2] != 0;
+        return true;
+    }
     if (!strncmp(s, "CFG ", 4)) {
         const char *p = s + 4;
         p = unhex_word(p, m->ssid, sizeof(m->ssid));

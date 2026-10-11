@@ -11,3 +11,7 @@ const char *bta_peer_name(void);
 void bta_beep(void);            // мелодия-писк в AUX
 void bta_music_toggle(void);    // тестовая «Ода к радости» вкл/выкл (не при BT)
 bool bta_music_on(void);
+// Маршруты от головы (AROUTE): BT в динамики головы / BT в AUX / звук головы в AUX
+void bta_set_routes(bool bt_spk, bool bt_aux, bool head_aux);
+bool bta_routes_seen(void);
+int bta_rate(void);             // частота Bluetooth-потока

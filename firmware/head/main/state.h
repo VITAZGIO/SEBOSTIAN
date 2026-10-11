@@ -33,6 +33,12 @@ typedef struct {
     volatile int64_t rf_rx_ms;
     char rf_tx[32];
 
+    // ---- аудио-связь (отдельный UART 3 Мбит/с) ----
+    volatile uint32_t al_rx_ok, al_rx_crc, al_rx_lost;   // Bluetooth со-процессора -> голова
+    volatile uint32_t al_tx_pkts;                        // голова -> AUX
+    volatile uint32_t cp_al_ok, cp_al_crc, cp_al_lost;   // что о приёме пишет со-процессор (строка A)
+    volatile int al_bt_rate;
+
     // ---- звук ----
     volatile bool sd_ok, file_ok, mic_ok, aux_plug, spk_muted, aux_muted;
     volatile uint32_t sd_mb;

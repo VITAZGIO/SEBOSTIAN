@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="760" height="420" fill="#ffffff"/>
+  <text x="380" y="30" text-anchor="middle" font-size="20" font-weight="bold">Аудио-связь: 2 новых провода (+ общий GND уже есть)</text>
+  <!-- голова -->
+  <rect x="40" y="60" width="230" height="300" rx="10" fill="#e8f0ff" stroke="#3060c0" stroke-width="2"/>
+  <text x="155" y="88" text-anchor="middle" font-size="17" font-weight="bold">ГОЛОВА ESP32-S3</text>
+  <circle cx="270" cy="150" r="7" fill="#3060c0"/><text x="255" y="155" text-anchor="end" font-size="16">GPIO1 (RX)</text>
+  <circle cx="270" cy="250" r="7" fill="#3060c0"/><text x="255" y="255" text-anchor="end" font-size="16">GPIO46 (TX)</text>
+  <circle cx="270" cy="330" r="7" fill="#000"/><text x="255" y="335" text-anchor="end" font-size="16">GND</text>
+  <text x="155" y="190" text-anchor="middle" font-size="12" fill="#555">DevKitC-1 (сверь с надписями):</text>
+  <text x="155" y="206" text-anchor="middle" font-size="12" fill="#555">1 — правый ряд, сразу после RX</text>
+  <text x="155" y="222" text-anchor="middle" font-size="12" fill="#555">46 — левый ряд, между 3 и 9</text>
+  <!-- сопроцессор -->
+  <rect x="490" y="60" width="230" height="300" rx="10" fill="#fff0e0" stroke="#c07020" stroke-width="2"/>
+  <text x="605" y="88" text-anchor="middle" font-size="17" font-weight="bold">СО-ПРОЦЕССОР ESP32</text>
+  <circle cx="490" cy="150" r="7" fill="#c07020"/><text x="505" y="155" font-size="16">GPIO23 (TX)</text>
+  <circle cx="490" cy="250" r="7" fill="#c07020"/><text x="505" y="255" font-size="16">GPIO19 (RX)</text>
+  <circle cx="490" cy="330" r="7" fill="#000"/><text x="505" y="335" font-size="16">GND</text>
+  <!-- провод 1 -->
+  <line x1="490" y1="150" x2="420" y2="150" stroke="#d00000" stroke-width="4"/>
+  <rect x="380" y="140" width="40" height="20" fill="#f4e2b0" stroke="#000"/><text x="400" y="134" text-anchor="middle" font-size="11">100 Ом*</text>
+  <line x1="380" y1="150" x2="270" y2="150" stroke="#d00000" stroke-width="4"/>
+  <polygon points="282,150 296,143 296,157" fill="#d00000"/>
+  <text x="380" y="185" text-anchor="middle" font-size="14" fill="#d00000">провод 1: Bluetooth → динамики</text>
+  <!-- провод 2 -->
+  <line x1="270" y1="250" x2="340" y2="250" stroke="#0070d0" stroke-width="4"/>
+  <rect x="340" y="240" width="40" height="20" fill="#f4e2b0" stroke="#000"/><text x="360" y="234" text-anchor="middle" font-size="11">100 Ом*</text>
+  <line x1="380" y1="250" x2="490" y2="250" stroke="#0070d0" stroke-width="4"/>
+  <polygon points="478,250 464,243 464,257" fill="#0070d0"/>
+  <text x="380" y="285" text-anchor="middle" font-size="14" fill="#0070d0">провод 2: голос Себастьяна → AUX</text>
+  <line x1="270" y1="330" x2="490" y2="330" stroke="#000" stroke-width="2" stroke-dasharray="6,4"/>
+  <text x="380" y="322" text-anchor="middle" font-size="12">GND — уже соединены</text>
+  <text x="380" y="385" text-anchor="middle" font-size="13">* резистор 100 Ом у ПЕРЕДАЮЩЕГО конца — гасит «звон» на 3 Мбит/с. Нет резистора — паяй напрямую.</text>
+  <text x="380" y="405" text-anchor="middle" font-size="13">Провода короткие (до 15–20 см), вести рядом с проводом GND. Паять только без питания.</text>
+</svg>

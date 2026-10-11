@@ -8,6 +8,7 @@
 #include "rf433.h"
 #include "btaudio.h"
 #include "otamode.h"
+#include "alink.h"
 #include "seb_proto.h"
 #include "seb_util.h"
 #include "esp_log.h"
@@ -54,6 +55,8 @@ static void handle(const char *s)
     case HC_S3B: return;                        // устарело (было для 74HC4053)
     case HC_SLEEP: g_sleep_ack = true; g_grace_reply = 2; return;
     case HC_FORCE: g_grace_reply = 1; return;
+    case HC_AROUTE: bta_set_routes(m.bt_spk, m.bt_aux, m.head_aux); return;
+    case HC_DUCK: cpal_set_duck(m.n != 0); return;
     case HC_CFG:
         strncpy(g_cfg.ssid, m.ssid, sizeof(g_cfg.ssid) - 1);
         strncpy(g_cfg.pass, m.pass, sizeof(g_cfg.pass) - 1);

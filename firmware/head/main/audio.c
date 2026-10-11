@@ -4,6 +4,7 @@
 #include "board.h"
 #include "state.h"
 #include "settings.h"
+#include "alink.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
@@ -58,8 +59,15 @@ static float s_fir_hist[REF_TAPS * 2];
 static int s_fir_pos, s_dec_phase;
 static volatile float s_ref_lvl;
 
+// Bluetooth из со-процессора (через аудио-связь)
+static seb_rs_t s_bt_rs;
+static int s_bt_rs_rate;
+static bool s_bt_flow;
+static volatile int64_t s_last_bt_ms;
+
 // состояние выходов
 static volatile int64_t s_last_sound_ms;
+static volatile bool s_voice;
 static volatile int64_t s_user_speaking_ms;
 static volatile bool s_ready;
 static int s_pin_spk = -1, s_pin_aux = -1;
@@ -200,19 +208,82 @@ static int mp3_pull(float *out, int frames)
     return made;
 }
 
-// ---------------- выходы ----------------
-bool audio_active(void) { return now_ms() - s_last_sound_ms < 300; }
+// ---------------- Bluetooth -> динамики ----------------
+// Часы телефона/со-процессора и головы чуть разные: держим кольцо около 100 мс,
+// слегка ускоряя/замедляя ресемплер (±0.3%) — без щелчков от переполнения/опустошения.
+static int bt_pull(float *out, int frames)
+{
+    seb_ring_t *r = alink_bt_ring();
+    int rate = alink_bt_rate();
+    if (!r->buf || rate < 8000) return 0;
+    if (rate != s_bt_rs_rate) {
+        seb_rs_init(&s_bt_rs, 2, rate, AUDIO_RATE);
+        s_bt_rs_rate = rate;
+        s_bt_flow = false;
+    }
+    uint32_t fill = seb_ring_fill(r) / 2, target = (uint32_t)rate / 10;
+    if (!s_bt_flow) {
+        if (fill < target) return 0;
+        s_bt_flow = true;
+    }
+    double err = ((double)fill - target) / target;
+    if (err > 1) err = 1;
+    if (err < -1) err = -1;
+    s_bt_rs.step = (double)rate / AUDIO_RATE * (1.0 + 0.003 * err);
+    int made = 0;
+    while (made < frames) {
+        const int16_t *p;
+        uint32_t n = seb_ring_peek(r, &p);
+        int inf = (int)(n / 2);
+        if (inf <= 0) break;
+        int used = 0;
+        int m = seb_rs_process(&s_bt_rs, p, inf, &used, out + 2 * made, frames - made);
+        seb_ring_consume(r, used * 2);
+        made += m;
+        if (!m && !used) break;
+    }
+    if (made < frames) s_bt_flow = false;          // опустело — снова копим 100 мс
+    return made;
+}
+
+// ---------------- маршруты и выходы ----------------
+// Действующий маршрут источника с учётом АВТО и штекера (без штекера AUX молчит -> динамики).
+static void eff_route(int route, bool plug, bool *spk, bool *aux)
+{
+    int r = route;
+    if (r == OUT_AUTO) r = plug ? OUT_AUX : OUT_SPK;
+    if (!plug && (r == OUT_AUX || r == OUT_BOTH)) r = OUT_SPK;
+    *spk = r == OUT_SPK || r == OUT_BOTH;
+    *aux = r == OUT_AUX || r == OUT_BOTH;
+}
+
+void audio_routes(audio_route_t *o)
+{
+    bool plug = g_st.aux_plug;
+    eff_route(g_set.route_head, plug, &o->head_spk, &o->head_aux);
+    eff_route(g_set.route_bt, plug, &o->bt_spk, &o->bt_aux);
+    if (g_st.bat_dead) o->head_spk = o->head_aux = o->bt_spk = o->bt_aux = false;
+    if (g_st.aux_muted) o->head_aux = o->bt_aux = false;
+}
+
+bool audio_active(void) { return now_ms() - s_last_sound_ms < 300 || now_ms() - s_last_bt_ms < 300; }
+bool audio_voice_active(void) { return s_voice; }
+bool audio_head_active(void) { return now_ms() - s_last_sound_ms < 300; }
 void audio_user_speaking(bool on) { if (on) s_user_speaking_ms = now_ms(); else s_user_speaking_ms = 0; }
 
 bool audio_spk_on(void)
 {
-    // AUX-режим со вставленным штекером: голова в AUX не звучит (шины раздельные),
-    // поэтому её собственный звук (голос, эффекты, MP3) всё равно идёт в динамики.
-    if (g_st.bat_dead) return false;
-    return !g_st.spk_muted && (g_set.out_mode != OUT_AUX || !g_st.aux_plug || audio_active());
+    audio_route_t r;
+    audio_routes(&r);
+    return !g_st.spk_muted && (r.head_spk || r.bt_spk);
 }
 
-bool audio_aux_on(void) { return !g_st.bat_dead && !g_st.aux_muted && g_st.aux_plug && g_set.out_mode != OUT_SPK; }
+bool audio_aux_on(void)
+{
+    audio_route_t r;
+    audio_routes(&r);
+    return g_st.aux_plug && !g_st.aux_muted && !g_st.bat_dead && (r.head_aux || r.bt_aux || g_st.cp_music);
+}
 
 static void apply_pins(void)
 {
@@ -224,10 +295,12 @@ static void apply_pins(void)
 
 void audio_apply_outputs(void)
 {
+    static const char *N[4] = {"ДИН", "AUX", "ОБА", "АВТО"};
+    audio_route_t r;
+    audio_routes(&r);
     apply_pins();
-    ESP_LOGI(TAG, "вывод %s: динамики %s, AUX %s (штекер %s)",
-             g_set.out_mode == OUT_SPK ? "DINAMIKI" : g_set.out_mode == OUT_AUX ? "AUX" : "OBA",
-             audio_spk_on() ? "ON" : "OFF", audio_aux_on() ? "ON" : "OFF", g_st.aux_plug ? "есть" : "нет");
+    ESP_LOGI(TAG, "голова %s -> дин %d AUX %d | BT %s -> дин %d AUX %d | штекер %s", N[g_set.route_head], r.head_spk,
+             r.head_aux, N[g_set.route_bt], r.bt_spk, r.bt_aux, g_st.aux_plug ? "есть" : "нет");
 }
 
 void audio_volume_step(int dir)
@@ -294,49 +367,83 @@ static void ref_push(const float *lr, int frames, bool spk)
 }
 
 // ---------------- задача микшера ----------------
+// head = голос + эффекты + MP3 (MP3 приглушается, пока говорят); bt = Bluetooth из со-процессора.
+// Динамики: (head) + (bt) по маршрутам, громкость не выше потолка, лимитер. Это же — reference для AEC.
+// AUX: head (громкость в доле от потолка, без потолка) -> аудио-связь -> со-процессор -> PCM5102A.
 static void mixer_task(void *arg)
 {
-    static float mix[2 * BLOCK], tmp[2 * BLOCK];
-    static int16_t out[2 * BLOCK];
+    static float head[2 * BLOCK], spk[2 * BLOCK], tmp[2 * BLOCK], bt[2 * BLOCK];
+    static int16_t out[2 * BLOCK], aux16[2 * BLOCK];
     int64_t t_start = now_ms();
     for (;;) {
-        memset(mix, 0, sizeof(mix));
+        audio_route_t rt;
+        audio_routes(&rt);
+        memset(head, 0, sizeof(head));
         bool sound = false;
         for (int k = 0; k < SRC_COUNT; k++) {
             int n = jsrc_pull(&s_src[k], tmp, BLOCK, k == SRC_TTS);
-            for (int i = 0; i < 2 * n; i++) mix[i] += tmp[i];
+            for (int i = 0; i < 2 * n; i++) head[i] += tmp[i];
             if (n) sound = true;
         }
         bool voice = s_src[SRC_TTS].busy || (s_user_speaking_ms && now_ms() - s_user_speaking_ms < 1500);
+        alink_set_duck(voice);
+        s_voice = voice;
         float duck_target = voice ? 0.25f : 1.0f;
+        float d0 = s_duck;
         int n = mp3_pull(tmp, BLOCK);
         if (n) sound = true;
         for (int i = 0; i < n; i++) {
-            s_duck += (duck_target - s_duck) * 0.002f;      // плавно, ~50 мс
-            mix[2 * i] += tmp[2 * i] * s_duck;
-            mix[2 * i + 1] += tmp[2 * i + 1] * s_duck;
+            s_duck += (duck_target - s_duck) * 0.002f;      // плавно, ~10 мс
+            head[2 * i] += tmp[2 * i] * s_duck;
+            head[2 * i + 1] += tmp[2 * i + 1] * s_duck;
         }
         if (sound) s_last_sound_ms = now_ms();
+
+        // Bluetooth — только если он идёт в динамики (иначе со-процессор его и не шлёт)
+        int nb = 0;
+        if (rt.bt_spk) nb = bt_pull(bt, BLOCK);
+        else if (alink_bt_ring()->buf) { seb_ring_clear(alink_bt_ring()); s_bt_flow = false; }
+        if (nb) s_last_bt_ms = now_ms();
 
         float vol = g_set.volume;
         if (vol > g_set.spk_ceil) vol = g_set.spk_ceil;
         const float k = vol / 32768.0f;
-        for (int i = 0; i < 2 * BLOCK; i++) mix[i] *= k;
+        float dk = d0;
+        for (int i = 0; i < BLOCK; i++) {
+            dk += (duck_target - dk) * 0.002f;
+            for (int c = 0; c < 2; c++) {
+                float v = rt.head_spk ? head[2 * i + c] : 0.0f;
+                if (i < nb) v += bt[2 * i + c] * dk;
+                spk[2 * i + c] = v * k;
+            }
+        }
+        if (!n) s_duck = dk;
         s_lim.thr = g_set.spk_ceil > 0.05f ? g_set.spk_ceil : 0.05f;   // сумма источников не выше потолка
-        seb_lim_process(&s_lim, mix, BLOCK);
+        seb_lim_process(&s_lim, spk, BLOCK);
         for (int i = 0; i < 2 * BLOCK; i++) {
-            int v = (int)lrintf(mix[i] * 32767.0f);
+            int v = (int)lrintf(spk[i] * 32767.0f);
             out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
         }
         size_t wr = 0;
         i2s_channel_write(s_tx, out, sizeof(out), &wr, portMAX_DELAY);
+
+        // AUX: звук головы со-процессору (шлём, только пока есть что играть — иначе связь молчит)
+        if (rt.head_aux && (sound || now_ms() - s_last_sound_ms < 500)) {
+            float ag = g_set.spk_ceil > 0.01f ? g_set.volume / g_set.spk_ceil : 1.0f;   // ручка громкости 0..потолок = 0..100% AUX
+            if (ag > 1.0f) ag = 1.0f;
+            for (int i = 0; i < 2 * BLOCK; i++) {
+                int v = (int)lrintf(head[i] * ag);
+                aux16[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+            }
+            alink_aux_push(aux16, BLOCK);
+        }
 
         if (!s_ready && now_ms() - t_start > 250) {          // I2S уже тактирует — можно снимать мьют
             s_ready = true;
             audio_apply_outputs();
         }
         apply_pins();
-        ref_push(mix, BLOCK, s_pin_spk == 1);
+        ref_push(spk, BLOCK, s_pin_spk == 1);
     }
 }
 

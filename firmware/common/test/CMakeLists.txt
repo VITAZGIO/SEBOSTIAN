@@ -8,7 +8,7 @@ endif()
 set(UNITY $ENV{IDF_PATH}/components/unity/unity/src)
 set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_executable(test_common test_common.c
-    ${SRC}/seb_proto.c ${SRC}/seb_text.c ${SRC}/seb_media.c ${SRC}/seb_dsp.c ${SRC}/seb_rc.c
+    ${SRC}/seb_proto.c ${SRC}/seb_text.c ${SRC}/seb_media.c ${SRC}/seb_dsp.c ${SRC}/seb_rc.c ${SRC}/seb_alink.c
     ${UNITY}/unity.c)
 target_include_directories(test_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include ${UNITY})
 target_compile_definitions(test_common PRIVATE UNITY_INCLUDE_DOUBLE)

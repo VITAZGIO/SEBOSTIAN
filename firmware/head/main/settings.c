@@ -53,7 +53,8 @@ void settings_load(void)
         get_str(h, "otapass", g_set.ota_pass, sizeof(g_set.ota_pass), OTA_PASS);
         get_str(h, "host", g_set.srv_host, sizeof(g_set.srv_host), SEB_HOST);
         g_set.srv_port = get_i32(h, "port", SEB_PORT);
-        g_set.out_mode = get_i32(h, "out", OUT_BOTH);
+        g_set.route_head = get_i32(h, "rhead", OUT_AUTO);
+        g_set.route_bt = get_i32(h, "rbt", OUT_AUTO);
         g_set.volume = get_i32(h, "vol", 30) / 100.0f;
         g_set.spk_ceil = get_i32(h, "ceil", 35) / 100.0f;
         g_set.wake_on = get_i32(h, "wake", 1) != 0;
@@ -67,7 +68,8 @@ void settings_load(void)
         strncpy(g_set.ota_pass, OTA_PASS, sizeof(g_set.ota_pass) - 1);
         strncpy(g_set.srv_host, SEB_HOST, sizeof(g_set.srv_host) - 1);
         g_set.srv_port = SEB_PORT;
-        g_set.out_mode = OUT_BOTH;
+        g_set.route_head = OUT_AUTO;
+        g_set.route_bt = OUT_AUTO;
         g_set.volume = 0.30f;
         g_set.spk_ceil = 0.35f;
         g_set.wake_on = true;
@@ -75,12 +77,13 @@ void settings_load(void)
         g_set.ns_on = false;
         g_set.aec_lead_ms = 10;
     }
-    if (g_set.out_mode < OUT_SPK || g_set.out_mode > OUT_BOTH) g_set.out_mode = OUT_BOTH;
+    if (g_set.route_head < OUT_SPK || g_set.route_head > OUT_AUTO) g_set.route_head = OUT_AUTO;
+    if (g_set.route_bt < OUT_SPK || g_set.route_bt > OUT_AUTO) g_set.route_bt = OUT_AUTO;
     if (g_set.spk_ceil < 0.05f || g_set.spk_ceil > 1.0f) g_set.spk_ceil = 0.35f;
     if (g_set.volume < 0 || g_set.volume > g_set.spk_ceil + 0.001f) g_set.volume = fminf(0.30f, g_set.spk_ceil);
     s_saved = g_set;
-    ESP_LOGI(TAG, "Wi-Fi \"%s\", сервер %s:%d, вывод %d, громкость %.2f (потолок %.2f), WAKE %d, AEC %d",
-             g_set.wifi_ssid, g_set.srv_host, g_set.srv_port, g_set.out_mode, g_set.volume, g_set.spk_ceil,
+    ESP_LOGI(TAG, "Wi-Fi \"%s\", сервер %s:%d, вывод голова %d / BT %d, громкость %.2f (потолок %.2f), WAKE %d, AEC %d",
+             g_set.wifi_ssid, g_set.srv_host, g_set.srv_port, g_set.route_head, g_set.route_bt, g_set.volume, g_set.spk_ceil,
              g_set.wake_on, g_set.aec_on);
 }
 
@@ -95,7 +98,8 @@ void settings_save(void)
     SS(ota_pass, "otapass");
     SS(srv_host, "host");
     SI(srv_port, "port", int32_t);
-    SI(out_mode, "out", int32_t);
+    SI(route_head, "rhead", int32_t);
+    SI(route_bt, "rbt", int32_t);
     if (lroundf(g_set.volume * 100) != lroundf(s_saved.volume * 100)) nvs_set_i32(h, "vol", lroundf(g_set.volume * 100));
     if (lroundf(g_set.spk_ceil * 100) != lroundf(s_saved.spk_ceil * 100)) nvs_set_i32(h, "ceil", lroundf(g_set.spk_ceil * 100));
     SI(wake_on, "wake", int32_t);
